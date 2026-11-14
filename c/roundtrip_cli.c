@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+#define _POSIX_C_SOURCE 200809L
 #include "roundtrip_cli.h"
 #include "encoder.h"
 #include "image_loader.h"
@@ -87,6 +88,13 @@ static uint8_t *load_image(const char *path,
 
 int roundtrip_cli_run(const cli_ctx_t *ctx)
 {
+    /* Codec-internal subsampling override; unset on the default 4:2:0 so
+       the legacy encode path produces identical bytes. */
+    if (ctx->chroma_mode == 444)
+        setenv("BITGRAIN_CHROMA", "444", 1);
+    else if (ctx->chroma_mode == 422)
+        setenv("BITGRAIN_CHROMA", "422", 1);
+
     /* Read stdin once if needed */
     uint8_t *stdin_buf = NULL;
     size_t   stdin_len = 0;

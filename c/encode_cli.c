@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+#define _POSIX_C_SOURCE 200809L
 #include "encode_cli.h"
 #include "encoder.h"
 #include "image_loader.h"
@@ -37,6 +38,14 @@ static uint8_t *load_image(const char *path, uint32_t *w, uint32_t *h, uint32_t 
 
 int encode_cli_run(const cli_ctx_t *ctx)
 {
+    /* Map the CLI subsampling choice onto the codec-internal override.
+       Default (0/420) leaves the variable unset, so output stays byte
+       identical to the historical encoder. */
+    if (ctx->chroma_mode == 444)
+        setenv("BITGRAIN_CHROMA", "444", 1);
+    else if (ctx->chroma_mode == 422)
+        setenv("BITGRAIN_CHROMA", "422", 1);
+
     /* Read stdin once if needed */
     uint8_t *stdin_buf = NULL;
     size_t   stdin_len = 0;

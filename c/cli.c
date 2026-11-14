@@ -31,6 +31,7 @@ static void usage_encode(const char *prog)
         "Options:\n"
         "  -o <path>              Output file or directory\n"
         "  --quality, -q <1-100>  Encode quality (default 85)\n"
+        "  --chroma <420|422|444> Chroma subsampling (default 420)\n"
         "  --threads, -t <n>      Worker threads (default runtime)\n"
         "  --deterministic        Alias for --threads 1\n"
         "  --overwrite, -y        Overwrite existing files\n"
@@ -39,9 +40,10 @@ static void usage_encode(const char *prog)
         "  %s encode photo.jpg                  # → photo.bg\n"
         "  %s encode photo.jpg -o photo.bg\n"
         "  %s encode ./images -o ./out --quality 80\n"
+        "  %s encode photo.png --chroma 444     # full-resolution chroma\n"
         "  cat photo.jpg | %s encode - -o out.bg\n"
         "  cat photo.jpg | %s encode - -o -  > out.bg\n",
-        prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog);
 }
 
 static void usage_decode(const char *prog)
@@ -77,6 +79,7 @@ static void usage_roundtrip(const char *prog)
         "  -o <path>              Output file or directory\n"
         "  --quality, -q <1-100>  Encode quality (default 85)\n"
         "  --output-quality, -Q <1-100>  Output JPG/WebP quality (default 85)\n"
+        "  --chroma <420|422|444> Chroma subsampling (default 420)\n"
         "  --threads, -t <n>      Worker threads (default runtime)\n"
         "  --deterministic        Alias for --threads 1\n"
         "  --metrics, -m          Print PSNR/SSIM after processing\n"
@@ -84,9 +87,10 @@ static void usage_roundtrip(const char *prog)
         "  --help                 This help\n\n"
         "Examples:\n"
         "  %s roundtrip photo.jpg -o out.jpg --quality 90 --metrics\n"
+        "  %s roundtrip photo.jpg --chroma 422 --metrics\n"
         "  %s roundtrip ./images -o ./out --quality 75\n"
         "  cat photo.jpg | %s roundtrip - -o out.jpg --metrics\n",
-        prog, prog, prog, prog);
+        prog, prog, prog, prog, prog);
 }
 
 void cli_usage(const char *prog)
@@ -225,6 +229,21 @@ int cli_parse_subcommand(int argc, char **argv, cli_ctx_t *ctx, const char *subc
             ctx->quality = atoi(argv[++i]);
             if (ctx->quality < 1)   ctx->quality = 1;
             if (ctx->quality > 100) ctx->quality = 100;
+            continue;
+        }
+        if (strcmp(a, "--chroma") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (strcmp(mode, "444") == 0 || strcmp(mode, "4:4:4") == 0)
+                ctx->chroma_mode = 444;
+            else if (strcmp(mode, "422") == 0 || strcmp(mode, "4:2:2") == 0)
+                ctx->chroma_mode = 422;
+            else if (strcmp(mode, "420") == 0 || strcmp(mode, "4:2:0") == 0)
+                ctx->chroma_mode = 420;
+            else {
+                fprintf(stderr, "Error: invalid --chroma '%s' (use 420, 422 or 444).\n", mode);
+                path_list_free(&input_specs);
+                return -1;
+            }
             continue;
         }
         if ((strcmp(a, "--threads") == 0 || strcmp(a, "-t") == 0) && i + 1 < argc) {

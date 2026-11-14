@@ -1,6 +1,7 @@
 use crate::bitstream;
 use crate::block::Block;
 use crate::blockizer::Blockizer;
+use crate::chroma::{self, ChromaSubsampling};
 use crate::colorspace;
 use crate::dct;
 use crate::entropy;
@@ -46,6 +47,10 @@ fn should_parallel_planes(width: usize, height: usize) -> bool {
 ///  17 = YCbCr 4:2:0 + A, very aggressive perceptual quant + chroma AC + DC delta
 ///  18 = YCbCr 4:2:0, ultra perceptual + AC sparsify + chroma AC + DC delta
 ///  19 = YCbCr 4:2:0 + A, ultra perceptual + AC sparsify + chroma AC + DC delta
+///  20 = YCbCr 4:2:2, same entropy profile as v18 (RGB input)
+///  21 = YCbCr 4:2:2 + A, same entropy profile as v19 (RGBA input)
+///  22 = YCbCr 4:4:4, same entropy profile as v18 (RGB input)
+///  23 = YCbCr 4:4:4 + A, same entropy profile as v19 (RGBA input)
 pub const BG_HEADER_SIZE: usize = 3 + 4 + 4 + 1;
 
 const BG_MAGIC_GRAY:    &[u8; 3] = b"BG\x01";
@@ -53,6 +58,10 @@ const BG_MAGIC_RGB:     &[u8; 3] = b"BG\x02";
 const BG_MAGIC_RGBA:    &[u8; 3] = b"BG\x03";
 const BG_MAGIC_YUV420_V8:  &[u8; 3] = b"BG\x12";
 const BG_MAGIC_YUV420A_V8: &[u8; 3] = b"BG\x13";
+const BG_MAGIC_YUV422:     &[u8; 3] = b"BG\x14";
+const BG_MAGIC_YUV422A:    &[u8; 3] = b"BG\x15";
+const BG_MAGIC_YUV444:     &[u8; 3] = b"BG\x16";
+const BG_MAGIC_YUV444A:    &[u8; 3] = b"BG\x17";
 
 /// Standard JPEG luminance quantization table (quality ~50).
 pub fn default_quant_table() -> [i16; 64] {
@@ -457,11 +466,49 @@ pub fn encode_rgb_ycbcr(
     image: &[u8], width: usize, height: usize, quality: u8,
     out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
 ) {
-    write_header(out, pos, BG_MAGIC_YUV420_V8, width, height, quality);
+    encode_rgb_ycbcr_mode(image, width, height, quality, out, pos, icc, ChromaSubsampling::H2V2);
+}
 
-    let (y, cb, cr) = colorspace::rgb_to_ycbcr420(image, width, height);
-    let cw = (width  + 1) / 2;
-    let ch = (height + 1) / 2;
+/// Encode RGB with an explicit chroma subsampling mode. The 4:2:0 mode
+/// delegates to the legacy pipeline unchanged (byte-identical output).
+pub fn encode_rgb_ycbcr_mode(
+    image: &[u8], width: usize, height: usize, quality: u8,
+    out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
+    mode: ChromaSubsampling,
+) {
+    // Default mode keeps the historical code path and its exact bytes.
+    if mode == ChromaSubsampling::H2V2 {
+        write_header(out, pos, BG_MAGIC_YUV420_V8, width, height, quality);
+        let (y, cb, cr) = colorspace::rgb_to_ycbcr420(image, width, height);
+        let cw = (width  + 1) / 2;
+        let ch = (height + 1) / 2;
+        encode_rgb_planes(out, pos, icc, width, height, cw, ch, quality, y, cb, cr, mode);
+        return;
+    }
+
+    let magic = match mode {
+        ChromaSubsampling::H2V1 => BG_MAGIC_YUV422,
+        ChromaSubsampling::H1V1 => BG_MAGIC_YUV444,
+        ChromaSubsampling::H2V2 => unreachable!(),
+    };
+    write_header(out, pos, magic, width, height, quality);
+
+    let npix = width * height;
+    let mut y = vec![0u8; npix];
+    colorspace::rgb_to_y_plane(image, width, height, &mut y);
+    let (cb, cr) = chroma::rgb_to_chroma(image, width, height, mode);
+    let (cw, ch) = mode.chroma_dims(width, height);
+    encode_rgb_planes(out, pos, icc, width, height, cw, ch, quality, y, cb, cr, mode);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_rgb_planes(
+    out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
+    width: usize, height: usize, cw: usize, ch: usize,
+    quality: u8, y: Vec<u8>, cb: Vec<u8>, cr: Vec<u8>,
+    mode: ChromaSubsampling,
+) {
+    let _ = mode;
 
     let luma_table   = quant_table_for_quality_perceptual_v4(quality);
     let chroma_table = chroma_quant_table_for_quality_perceptual_v4(quality);
@@ -513,11 +560,50 @@ pub fn encode_rgba_ycbcr(
     image: &[u8], width: usize, height: usize, quality: u8,
     out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
 ) {
-    write_header(out, pos, BG_MAGIC_YUV420A_V8, width, height, quality);
+    encode_rgba_ycbcr_mode(image, width, height, quality, out, pos, icc, ChromaSubsampling::H2V2);
+}
 
-    let (y, cb, cr, a) = colorspace::rgba_to_ycbcr420a(image, width, height);
-    let cw = (width  + 1) / 2;
-    let ch = (height + 1) / 2;
+/// Encode RGBA with an explicit chroma subsampling mode. The 4:2:0 mode
+/// delegates to the legacy pipeline unchanged (byte-identical output).
+pub fn encode_rgba_ycbcr_mode(
+    image: &[u8], width: usize, height: usize, quality: u8,
+    out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
+    mode: ChromaSubsampling,
+) {
+    // Default mode keeps the historical code path and its exact bytes.
+    if mode == ChromaSubsampling::H2V2 {
+        write_header(out, pos, BG_MAGIC_YUV420A_V8, width, height, quality);
+        let (y, cb, cr, a) = colorspace::rgba_to_ycbcr420a(image, width, height);
+        let cw = (width  + 1) / 2;
+        let ch = (height + 1) / 2;
+        encode_rgba_planes(out, pos, icc, width, height, cw, ch, quality, y, cb, cr, a, mode);
+        return;
+    }
+
+    let magic = match mode {
+        ChromaSubsampling::H2V1 => BG_MAGIC_YUV422A,
+        ChromaSubsampling::H1V1 => BG_MAGIC_YUV444A,
+        ChromaSubsampling::H2V2 => unreachable!(),
+    };
+    write_header(out, pos, magic, width, height, quality);
+
+    let npix = width * height;
+    let mut y = vec![0u8; npix];
+    let mut a = vec![0u8; npix];
+    colorspace::rgba_to_ya_planes(image, width, height, &mut y, &mut a);
+    let (cb, cr) = chroma::rgba_to_chroma(image, width, height, mode);
+    let (cw, ch) = mode.chroma_dims(width, height);
+    encode_rgba_planes(out, pos, icc, width, height, cw, ch, quality, y, cb, cr, a, mode);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_rgba_planes(
+    out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
+    width: usize, height: usize, cw: usize, ch: usize,
+    quality: u8, y: Vec<u8>, cb: Vec<u8>, cr: Vec<u8>, a: Vec<u8>,
+    mode: ChromaSubsampling,
+) {
+    let _ = mode;
 
     let luma_table   = quant_table_for_quality_perceptual_v4(quality);
     let chroma_table = chroma_quant_table_for_quality_perceptual_v4(quality);
@@ -583,14 +669,16 @@ pub fn encode_rgb(
     out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
 ) {
     // Default to the better YCbCr path; callers that need legacy RLE use encode_rgb_rle
-    encode_rgb_ycbcr(image, width, height, quality, out, pos, icc);
+    let mode = ChromaSubsampling::from_env();
+    encode_rgb_ycbcr_mode(image, width, height, quality, out, pos, icc, mode);
 }
 
 pub fn encode_rgba(
     image: &[u8], width: usize, height: usize, quality: u8,
     out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
 ) {
-    encode_rgba_ycbcr(image, width, height, quality, out, pos, icc);
+    let mode = ChromaSubsampling::from_env();
+    encode_rgba_ycbcr_mode(image, width, height, quality, out, pos, icc, mode);
 }
 
 /// Legacy RLE RGB encoder (v2). Used when explicit backward-compat is needed.
@@ -646,4 +734,3 @@ pub fn encode_rgba_rle(
     for buf in &channel_bufs { bitstream::write_bytes(out, pos, buf); }
     write_icc_trailer(out, pos, icc);
 }
-

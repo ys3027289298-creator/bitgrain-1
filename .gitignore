@@ -16,6 +16,11 @@ rust/target/
 # Output directories
 test_out/
 bench_out/
+tests/chroma/*.bg
+tests/chroma/*.bmp
+tests/chroma/base-*.bg
+tests/chroma/new-*.bg
+bitgrain-bench
 
 # Output/test images (optional; remove if you want to track samples)
 *.png

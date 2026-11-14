@@ -31,8 +31,35 @@ The image is divided into 8×8 blocks in scan order (left-to-right, top-to-botto
 - **v1 (grayscale RLE):** One full-resolution plane.
 - **v2/v3 (legacy RLE):** 3 or 4 full-resolution planes.
 - **v4+ (YCbCr):**
-  - RGB profiles: Y full-resolution + Cb/Cr at 4:2:0 (`ceil(w/2) x ceil(h/2)`).
+  - RGB profiles: Y full-resolution + Cb/Cr at 4:2:0 (`ceil(w/2) x ceil(h/2)`),
+    except v20/v22 (see table below).
   - RGBA profiles: same Y/Cb/Cr plus full-resolution alpha plane.
+
+### Chroma subsampling profiles (v18+)
+
+| Version | Profile | Cb/Cr plane size | Sampling |
+|---------|---------|------------------|----------|
+| 18 | RGB 4:2:0 | `ceil(w/2) x ceil(h/2)` | 2×2 box average |
+| 19 | RGBA 4:2:0 | `ceil(w/2) x ceil(h/2)` | 2×2 box average |
+| 20 | RGB 4:2:2 | `ceil(w/2) x h` | horizontal 1×2 box average |
+| 21 | RGBA 4:2:2 | `ceil(w/2) x h` | horizontal 1×2 box average |
+| 22 | RGB 4:4:4 | `w x h` | no subsampling |
+| 23 | RGBA 4:4:4 | `w x h` | no subsampling |
+
+v20–v23 reuse the v18/v19 entropy profile (perceptual-v4 quant, chroma AC
+table, DC delta). Only the chroma plane dimensions differ.
+
+**Sampling positions (centroid aligned, no grid shift):**
+
+- 4:2:2 sample `(cx, cy)` averages luma pixels `(2cx, cy)` and `(2cx+1, cy)`;
+  its center is the pair centroid `x = 2cx + 0.5, y = cy`.
+- 4:2:0 sample `(cx, cy)` averages the 2×2 block `(2cx, 2cy)…(2cx+1, 2cy+1)`;
+  its center is the block centroid `(2cx + 0.5, 2cy + 0.5)`.
+- Edge cells (odd width/height) average only the in-bounds pixels and the
+  last column/row is replicated on reconstruction.
+- Decoding uses nearest-neighbor upsampling: luma `(px, py)` selects
+  `(px / step_x, py / step_y)`, the identical cell partition used by the
+  encoder, so no positional offset is introduced.
 
 ## Block Encoding
 

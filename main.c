@@ -28,6 +28,7 @@ static void print_global_help(const char *prog)
         "Options (all commands):\n"
         "  -o <path>            Output file or directory\n"
         "  --quality <1-100>    Encode quality (default 85)\n"
+        "  --chroma <420|422|444>  Chroma subsampling (default 420)\n"
         "  --output-quality <1-100>  Output JPG/WebP quality (default 85)\n"
         "  --threads <n>        Worker threads (default runtime)\n"
         "  --deterministic      Alias for --threads 1\n"

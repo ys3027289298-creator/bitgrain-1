@@ -55,6 +55,7 @@ Legacy flags are still supported (`-i/-d/-cd/...`) for backward compatibility.
 |--------|-------------|
 | `-o, --output <path>` | Output file or directory |
 | `-q, --quality <1-100>` | Encode quality (default 85) |
+| `--chroma <420\|422\|444>` | Chroma subsampling (default 420; same bytes as before when omitted) |
 | `-Q, --output-quality <1-100>` | Output JPG/WebP quality (default 85) |
 | `-t, --threads <n>` | Worker threads for codec internals |
 | `--deterministic` | Alias for `--threads 1` |
@@ -84,6 +85,15 @@ Versions:
 - `v14-v15`: aggressive perceptual profile
 - `v16-v17`: very aggressive perceptual profile
 - `v18-v19`: ultra perceptual + AC sparsify profile (best compression in current branch)
+- `v20-v21`: YCbCr 4:2:2 (Cb/Cr halved horizontally only), same entropy profile as v18/v19
+- `v22-v23`: YCbCr 4:4:4 (full-resolution Cb/Cr), same entropy profile as v18/v19
+
+Chroma subsampling is selected with `--chroma` (or the `BITGRAIN_CHROMA`
+environment variable: `420`, `422`, `444`). Sampling cells are centroid
+aligned (4:2:2 averages each 1×2 luma pair, 4:2:0 each 2×2 block); decoding
+upsamples with matching nearest-neighbor cells, so the sampling grid never
+shifts. Omitting the option keeps the historical 4:2:0 path and produces a
+byte-identical `.bg` stream.
 
 ## C API
 

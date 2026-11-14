@@ -7,6 +7,7 @@
 //!
 //! 4:2:0 subsampling: Cb and Cr planes are downsampled to (ceil(W/2)) × (ceil(H/2))
 //! using a simple 2×2 box average, matching JPEG's default chroma subsampling.
+use crate::chroma::ChromaSubsampling;
 use rayon::prelude::*;
 const PARALLEL_DECODE_PIXELS_THRESHOLD: usize = 262_144; // ~512x512
 const PARALLEL_ENCODE_PIXELS_THRESHOLD: usize = 262_144; // ~512x512
@@ -851,6 +852,47 @@ unsafe fn rgba_to_ya_row_neon(src_row: &[u8], y_row: &mut [u8], a_row: &mut [u8]
 /// Convert interleaved RGB (3 bytes/pixel) to separate Y, Cb, Cr planes.
 /// Y is full resolution (w×h). Cb and Cr are 4:2:0 subsampled: ((w+1)/2) × ((h+1)/2).
 /// Returns (Y, Cb, Cr).
+/// Fill a preallocated w×h buffer with the BT.601 full-range luma plane.
+/// Shares the exact SIMD/scalar row kernels used by the 4:2:0 encoder.
+pub fn rgb_to_y_plane(image: &[u8], w: usize, h: usize, y_plane: &mut [u8]) {
+    let npix = w * h;
+    debug_assert_eq!(y_plane.len(), npix);
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let use_sse2 = is_x86_feature_detected!("sse2");
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let use_sse2 = false;
+    #[cfg(target_arch = "arm")]
+    let use_neon = is_arm_feature_detected!("neon");
+    #[cfg(target_arch = "aarch64")]
+    let use_neon = true;
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+    let use_neon = false;
+
+    let conv = |py: usize, y_row: &mut [u8]| {
+        let src_row = &image[(py * w * 3)..((py + 1) * w * 3)];
+        if use_sse2 {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            unsafe { rgb_to_y_row_sse2(src_row, y_row, w) }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            rgb_to_y_row_scalar(src_row, y_row, w);
+        } else if use_neon {
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            unsafe { rgb_to_y_row_neon(src_row, y_row, w) }
+            #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+            rgb_to_y_row_scalar(src_row, y_row, w);
+        } else {
+            rgb_to_y_row_scalar(src_row, y_row, w);
+        }
+    };
+
+    if npix >= PARALLEL_ENCODE_PIXELS_THRESHOLD {
+        y_plane.par_chunks_mut(w).enumerate().for_each(|(py, row)| conv(py, row));
+    } else {
+        y_plane.chunks_mut(w).enumerate().for_each(|(py, row)| conv(py, row));
+    }
+}
+
 pub fn rgb_to_ycbcr420(image: &[u8], w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let npix = w * h;
     let cw = (w + 1) / 2;
@@ -972,6 +1014,57 @@ pub fn rgb_to_ycbcr420(image: &[u8], w: usize, h: usize) -> (Vec<u8>, Vec<u8>, V
     }
 
     (y_plane, cb_plane, cr_plane)
+}
+
+/// Fill preallocated w×h buffers with the luma and alpha planes of an
+/// interleaved RGBA image. Shares the row kernels of the 4:2:0 RGBA path.
+pub fn rgba_to_ya_planes(image: &[u8], w: usize, h: usize,
+                         y_plane: &mut [u8], a_plane: &mut [u8]) {
+    let npix = w * h;
+    debug_assert_eq!(y_plane.len(), npix);
+    debug_assert_eq!(a_plane.len(), npix);
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let use_sse2 = is_x86_feature_detected!("sse2");
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let use_sse2 = false;
+    #[cfg(target_arch = "arm")]
+    let use_neon = is_arm_feature_detected!("neon");
+    #[cfg(target_arch = "aarch64")]
+    let use_neon = true;
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+    let use_neon = false;
+
+    let conv = |py: usize, y_row: &mut [u8], a_row: &mut [u8]| {
+        let src_row = &image[(py * w * 4)..((py + 1) * w * 4)];
+        if use_sse2 {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            unsafe { rgba_to_ya_row_sse2(src_row, y_row, a_row, w) }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            rgba_to_ya_row_scalar(src_row, y_row, a_row, w);
+        } else if use_neon {
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            unsafe { rgba_to_ya_row_neon(src_row, y_row, a_row, w) }
+            #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+            rgba_to_ya_row_scalar(src_row, y_row, a_row, w);
+        } else {
+            rgba_to_ya_row_scalar(src_row, y_row, a_row, w);
+        }
+    };
+
+    if npix >= PARALLEL_ENCODE_PIXELS_THRESHOLD {
+        y_plane
+            .par_chunks_mut(w)
+            .zip(a_plane.par_chunks_mut(w))
+            .enumerate()
+            .for_each(|(py, (y_row, a_row))| conv(py, y_row, a_row));
+    } else {
+        y_plane
+            .chunks_mut(w)
+            .zip(a_plane.chunks_mut(w))
+            .enumerate()
+            .for_each(|(py, (y_row, a_row))| conv(py, y_row, a_row));
+    }
 }
 
 /// Convert interleaved RGBA (4 bytes/pixel) to Y, Cb, Cr, A planes.
@@ -1233,5 +1326,72 @@ pub fn ycbcr420a_to_rgba(y: &[u8], cb: &[u8], cr: &[u8], a: &[u8], w: usize, _h:
         out.chunks_mut(w * 4)
             .enumerate()
             .for_each(|(py, out_row)| decode_row(py, out_row));
+    }
+}
+
+#[inline]
+fn ycbcr_to_rgb_pixel(y: i32, cb: i32, cr: i32) -> (u8, u8, u8) {
+    let cbi = cb - 128;
+    let cri = cr - 128;
+    let r = clamp_u8(y + ((359 * cri) >> 8));
+    let g = clamp_u8(y - ((88 * cbi + 183 * cri) >> 8));
+    let b = clamp_u8(y + ((454 * cbi) >> 8));
+    (r, g, b)
+}
+
+/// Generic YCbCr → interleaved RGB reconstruction for any chroma mode.
+/// Cb/Cr are nearest-neighbor upsampled using the same centroid cells the
+/// encoder averaged (see `chroma::upsample_plane`), so no grid shift occurs.
+pub fn ycbcr_to_rgb_mode(
+    y: &[u8], cb: &[u8], cr: &[u8],
+    w: usize, h: usize, mode: ChromaSubsampling, out: &mut [u8],
+) {
+    let (cw, ch) = mode.chroma_dims(w, h);
+    let step_x = if matches!(mode, ChromaSubsampling::H1V1) { 1 } else { 2 };
+    let step_y = if matches!(mode, ChromaSubsampling::H2V2) { 2 } else { 1 };
+    debug_assert_eq!(y.len(), w * h);
+    debug_assert_eq!(cb.len(), cw * ch);
+    debug_assert_eq!(out.len(), w * h * 3);
+
+    for py in 0..h {
+        let cy = (py / step_y).min(ch - 1);
+        for px in 0..w {
+            let cx = (px / step_x).min(cw - 1);
+            let cidx = cy * cw + cx;
+            let (r, g, b) = ycbcr_to_rgb_pixel(y[py * w + px] as i32, cb[cidx] as i32, cr[cidx] as i32);
+            let o = (py * w + px) * 3;
+            out[o] = r;
+            out[o + 1] = g;
+            out[o + 2] = b;
+        }
+    }
+}
+
+/// Generic YCbCr + alpha → interleaved RGBA reconstruction for any chroma
+/// mode. Alpha stays at full luma resolution.
+pub fn ycbcra_to_rgba_mode(
+    y: &[u8], cb: &[u8], cr: &[u8], a: &[u8],
+    w: usize, h: usize, mode: ChromaSubsampling, out: &mut [u8],
+) {
+    let (cw, ch) = mode.chroma_dims(w, h);
+    let step_x = if matches!(mode, ChromaSubsampling::H1V1) { 1 } else { 2 };
+    let step_y = if matches!(mode, ChromaSubsampling::H2V2) { 2 } else { 1 };
+    debug_assert_eq!(y.len(), w * h);
+    debug_assert_eq!(cb.len(), cw * ch);
+    debug_assert_eq!(a.len(), w * h);
+    debug_assert_eq!(out.len(), w * h * 4);
+
+    for py in 0..h {
+        let cy = (py / step_y).min(ch - 1);
+        for px in 0..w {
+            let cx = (px / step_x).min(cw - 1);
+            let cidx = cy * cw + cx;
+            let (r, g, b) = ycbcr_to_rgb_pixel(y[py * w + px] as i32, cb[cidx] as i32, cr[cidx] as i32);
+            let o = (py * w + px) * 4;
+            out[o] = r;
+            out[o + 1] = g;
+            out[o + 2] = b;
+            out[o + 3] = a[py * w + px];
+        }
     }
 }

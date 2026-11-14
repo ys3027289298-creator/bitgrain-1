@@ -21,6 +21,7 @@ typedef struct {
     int jpeg_out_quality;
     int show_metrics;
     int threads;               /* worker threads; 0 = runtime default */
+    int chroma_mode;           /* 0 = default 4:2:0, 422, 444 */
     int use_stdin;             /* input is stdin ("-") */
     int use_stdout;            /* output is stdout ("-") */
 } cli_ctx_t;

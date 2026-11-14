@@ -1,6 +1,7 @@
 pub mod block;
 pub mod blockizer;
 pub mod bitstream;
+pub mod chroma;
 pub mod colorspace;
 pub mod dct;
 pub mod decoder;
