@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #define _POSIX_C_SOURCE 200809L
 #include "cli.h"
+#include "encoder.h"
 #include "platform.h"
 #include "config.h"
 #include <stdio.h>
@@ -31,6 +32,8 @@ static void usage_encode(const char *prog)
         "Options:\n"
         "  -o <path>              Output file or directory\n"
         "  --quality, -q <1-100>  Encode quality (default 85)\n"
+        "  --dither <mode>        Quantization dither: off, ordered, error-diffusion\n"
+        "  --dither-strength <0-100>  Dither perturbation strength (default 0)\n"
         "  --threads, -t <n>      Worker threads (default runtime)\n"
         "  --deterministic        Alias for --threads 1\n"
         "  --overwrite, -y        Overwrite existing files\n"
@@ -77,6 +80,8 @@ static void usage_roundtrip(const char *prog)
         "  -o <path>              Output file or directory\n"
         "  --quality, -q <1-100>  Encode quality (default 85)\n"
         "  --output-quality, -Q <1-100>  Output JPG/WebP quality (default 85)\n"
+        "  --dither <mode>        Quantization dither: off, ordered, error-diffusion\n"
+        "  --dither-strength <0-100>  Dither perturbation strength (default 0)\n"
         "  --threads, -t <n>      Worker threads (default runtime)\n"
         "  --deterministic        Alias for --threads 1\n"
         "  --metrics, -m          Print PSNR/SSIM after processing\n"
@@ -183,6 +188,8 @@ int cli_parse_subcommand(int argc, char **argv, cli_ctx_t *ctx, const char *subc
     ctx->quality = 85;
     ctx->jpeg_out_quality = 85;
     ctx->threads = 0;
+    ctx->dither_mode = 0;
+    ctx->dither_strength = -1;
 
     if (strcmp(subcmd, "decode") == 0)
         ctx->decode_mode = 1;
@@ -234,6 +241,39 @@ int cli_parse_subcommand(int argc, char **argv, cli_ctx_t *ctx, const char *subc
         }
         if (strcmp(a, "--deterministic") == 0) {
             ctx->threads = 1;
+            continue;
+        }
+
+        /* --dither <off|ordered|error-diffusion> */
+        if (strcmp(a, "--dither") == 0 && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (strcmp(m, "off") == 0) {
+                ctx->dither_mode = BITGRAIN_DITHER_OFF;
+            } else if (strcmp(m, "ordered") == 0) {
+                ctx->dither_mode = BITGRAIN_DITHER_ORDERED;
+            } else if (strcmp(m, "error-diffusion") == 0 ||
+                       strcmp(m, "floyd-steinberg") == 0) {
+                ctx->dither_mode = BITGRAIN_DITHER_ERROR_DIFFUSION;
+            } else {
+                fprintf(stderr,
+                        "Error: --dither must be one of off, ordered, error-diffusion.\n");
+                path_list_free(&input_specs);
+                return -1;
+            }
+            continue;
+        }
+
+        /* --dither-strength <0-100> */
+        if (strcmp(a, "--dither-strength") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            long v = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || v < 0 || v > 100) {
+                fprintf(stderr,
+                        "Error: --dither-strength must be an integer in 0..=100.\n");
+                path_list_free(&input_specs);
+                return -1;
+            }
+            ctx->dither_strength = (int)v;
             continue;
         }
 
@@ -334,6 +374,8 @@ int cli_parse(int argc, char **argv, cli_ctx_t *ctx)
     ctx->quality = 85;
     ctx->jpeg_out_quality = 85;
     ctx->threads = 0;
+    ctx->dither_mode = 0;
+    ctx->dither_strength = -1;
 
     while ((opt = getopt(argc, argv, "i:o:cdq:Q:t:myvh")) != -1) {
         switch (opt) {

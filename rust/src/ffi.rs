@@ -25,6 +25,11 @@ const BITGRAIN_ERR_DECODE_FAILED: i32 = 2;
 const BITGRAIN_ERR_THREAD_INIT: i32 = 3;
 const BITGRAIN_ERR_PANIC: i32 = 100;
 
+/// Dither mode values shared with the C API. Keep in sync with `encoder.h`.
+pub const BITGRAIN_DITHER_OFF: i32 = 0;
+pub const BITGRAIN_DITHER_ORDERED: i32 = 1;
+pub const BITGRAIN_DITHER_ERROR_DIFFUSION: i32 = 2;
+
 thread_local! {
     static LAST_ERROR_CODE: Cell<i32> = const { Cell::new(BITGRAIN_OK) };
     static LAST_ERROR_MSG: RefCell<CString> = RefCell::new(CString::new("ok").expect("static cstring"));
@@ -73,6 +78,49 @@ pub extern "C" fn bitgrain_last_error_message() -> *const i8 {
 #[no_mangle]
 pub extern "C" fn bitgrain_clear_error() {
     clear_last_error();
+}
+
+/// Configure quantization dithering for subsequent encode calls.
+///
+/// mode: 0 = off, 1 = ordered (Bayer), 2 = error diffusion (Floyd-Steinberg).
+/// strength: perturbation percentage, 0..=100. strength 0 disables dithering
+/// even when a non-off mode is selected; values above 100 are rejected.
+/// Returns 0 on success, -1 with BITGRAIN_ERR_INVALID_ARG on bad parameters.
+/// Does not change any existing encoder entry-point signature.
+#[no_mangle]
+pub extern "C" fn bitgrain_set_dither(mode: i32, strength: i32) -> i32 {
+    clear_last_error();
+    let dither_mode = match mode {
+        BITGRAIN_DITHER_OFF => crate::dither::DitherMode::Off,
+        BITGRAIN_DITHER_ORDERED => crate::dither::DitherMode::Ordered,
+        BITGRAIN_DITHER_ERROR_DIFFUSION => crate::dither::DitherMode::ErrorDiffusion,
+        _ => {
+            return fail(
+                BITGRAIN_ERR_INVALID_ARG,
+                "dither mode must be 0 (off), 1 (ordered) or 2 (error diffusion)",
+            );
+        }
+    };
+    if !(0..=100).contains(&strength) {
+        return fail(BITGRAIN_ERR_INVALID_ARG, "dither strength must be in 0..=100");
+    }
+    ffi_guard(|| {
+        match crate::dither::set_dither_config(dither_mode, strength as u8) {
+            Ok(()) => 0,
+            Err(msg) => fail(BITGRAIN_ERR_INVALID_ARG, msg),
+        }
+    })
+}
+
+/// Reset dithering to the disabled default (restores byte-identical legacy
+/// encoding).
+#[no_mangle]
+pub extern "C" fn bitgrain_clear_dither() -> i32 {
+    clear_last_error();
+    ffi_guard(|| {
+        crate::dither::clear_dither_config();
+        0
+    })
 }
 
 /// Configure global Rayon thread pool size.

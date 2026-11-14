@@ -58,11 +58,43 @@ Legacy flags are still supported (`-i/-d/-cd/...`) for backward compatibility.
 | `-Q, --output-quality <1-100>` | Output JPG/WebP quality (default 85) |
 | `-t, --threads <n>` | Worker threads for codec internals |
 | `--deterministic` | Alias for `--threads 1` |
+| `--dither <mode>` | Quantization dither: `off`, `ordered` (Bayer), `error-diffusion` (Floyd-Steinberg) |
+| `--dither-strength <0-100>` | Dither perturbation strength (default 0) |
 | `-m, --metrics` | Round-trip: print PSNR and SSIM |
 | `-y, --overwrite` | Overwrite outputs |
 | `-v, --version` / `-h, --help` | Version / help |
 
 Input formats: JPEG, PNG, BMP, GIF, TGA, PGM, PSD, HDR, WebP (stb_image + libwebp).
+
+### Quantization dithering (banding control)
+
+At low bit rates, smooth gradients collapse into visible bands because
+neighboring 8x8 blocks quantize their DC term onto the same level. Dithering
+adds a bounded, deterministic perturbation before the forward DCT so adjacent
+blocks alternate between neighboring reconstruction levels, dissolving the
+hard band edges. Two algorithms are available:
+
+- `ordered` — 8x8 Bayer block-grid modulation; stateless and cheapest.
+- `error-diffusion` — Floyd-Steinberg diffusion plus the same block-grid
+  seed, adding intermediate levels where AC coefficients survive.
+
+Strength is a percentage in `0..=100`. `--dither-strength 0` (or
+`--dither off`) leaves the encoded stream byte-identical to the undithered
+encoder; values outside the range are rejected. The equivalent C API calls
+are `bitgrain_set_dither(mode, strength)` and `bitgrain_clear_dither()`.
+
+```bash
+bitgrain encode gradient.png -o gradient.bg --quality 5 \
+    --dither ordered --dither-strength 75
+```
+
+Self-contained verification (generates its own small gradient, reports
+gradient-region level counts and `.bg` sizes, checks byte-identity and the
+error paths):
+
+```bash
+bash tests/dither_test.sh
+```
 
 Decode/roundtrip output formats by `-o` extension: `.jpg/.jpeg`, `.png`, `.bmp`, `.tga`, `.pgm` (grayscale), `.webp`.
 

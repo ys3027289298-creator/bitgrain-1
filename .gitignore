@@ -16,6 +16,8 @@ rust/target/
 # Output directories
 test_out/
 bench_out/
+tests/out-dither/
+tests/out/
 
 # Output/test images (optional; remove if you want to track samples)
 *.png

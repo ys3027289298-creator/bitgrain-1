@@ -4,6 +4,7 @@ pub mod bitstream;
 pub mod colorspace;
 pub mod dct;
 pub mod decoder;
+pub mod dither;
 pub mod encoder;
 pub mod entropy;
 pub mod ffi;

@@ -87,6 +87,17 @@ static uint8_t *load_image(const char *path,
 
 int roundtrip_cli_run(const cli_ctx_t *ctx)
 {
+    {
+        int mode = ctx->dither_mode;
+        int strength = ctx->dither_strength < 0
+                           ? (mode == BITGRAIN_DITHER_OFF ? 0 : 100)
+                           : ctx->dither_strength;
+        if (bitgrain_set_dither(mode, strength) != 0) {
+            fprintf(stderr, "Error: %s\n", bitgrain_last_error_message());
+            return 1;
+        }
+    }
+
     /* Read stdin once if needed */
     uint8_t *stdin_buf = NULL;
     size_t   stdin_len = 0;

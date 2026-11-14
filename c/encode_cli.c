@@ -9,6 +9,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Apply CLI dither settings to the codec. Strength defaults to 0 (off)
+ * unless explicitly provided; an explicit dither mode without strength
+ * selects full-strength dithering (100) so the flag is useful on its own. */
+static int apply_dither_config(const cli_ctx_t *ctx)
+{
+    int mode = ctx->dither_mode;
+    int strength = ctx->dither_strength;
+    if (strength < 0)
+        strength = (mode == BITGRAIN_DITHER_OFF) ? 0 : 100;
+    if (bitgrain_set_dither(mode, strength) != 0) {
+        fprintf(stderr, "Error: %s\n", bitgrain_last_error_message());
+        return -1;
+    }
+    return 0;
+}
+
 /* Load image from path or stdin ("-"). Returns pixels and fills channels. */
 static uint8_t *load_image(const char *path, uint32_t *w, uint32_t *h, uint32_t *channels,
                             const uint8_t *stdin_buf, size_t stdin_len)
@@ -37,6 +53,9 @@ static uint8_t *load_image(const char *path, uint32_t *w, uint32_t *h, uint32_t 
 
 int encode_cli_run(const cli_ctx_t *ctx)
 {
+    if (apply_dither_config(ctx) != 0)
+        return 1;
+
     /* Read stdin once if needed */
     uint8_t *stdin_buf = NULL;
     size_t   stdin_len = 0;

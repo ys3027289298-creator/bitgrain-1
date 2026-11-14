@@ -21,6 +21,8 @@ typedef struct {
     int jpeg_out_quality;
     int show_metrics;
     int threads;               /* worker threads; 0 = runtime default */
+    int dither_mode;           /* 0 = off, 1 = ordered, 2 = error diffusion */
+    int dither_strength;       /* 0..=100; -1 = not provided (defaults to 0) */
     int use_stdin;             /* input is stdin ("-") */
     int use_stdout;            /* output is stdout ("-") */
 } cli_ctx_t;

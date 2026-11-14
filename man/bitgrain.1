@@ -94,6 +94,20 @@ Quality for encoding into
 .BR .bg
 (default 85).
 Higher values = less quantization = better quality, larger file.
+.TP
+.BI \-\-dither " " mode
+Quantization dither to reduce banding on smooth gradients:
+.BR off ,
+.BR ordered
+(8x8 Bayer), or
+.BR error-diffusion
+(Floyd-Steinberg). Default
+.BR off .
+.TP
+.BI \-\-dither\-strength " " 0-100
+Dither perturbation strength as a percentage (default 0).
+Strength 0 leaves the output byte-identical to an undithered encode;
+values outside 0-100 are rejected.
 .SS decode options
 .TP
 .BI \-\-output\-quality " " 1-100 ", " \-Q " " 1-100
@@ -106,6 +120,17 @@ Encode quality (default 85).
 .TP
 .BI \-\-output\-quality " " 1-100 ", " \-Q " " 1-100
 Output JPEG/WebP quality (default 85).
+.TP
+.BI \-\-dither " " mode
+Quantization dither:
+.BR off ,
+.BR ordered ,
+or
+.BR error-diffusion
+(default off).
+.TP
+.BI \-\-dither\-strength " " 0-100
+Dither strength percentage (default 0); see encode options.
 .TP
 .B \-\-metrics, \-m
 Print PSNR and SSIM versus the original after processing.

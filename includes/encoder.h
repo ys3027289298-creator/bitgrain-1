@@ -16,6 +16,13 @@ enum {
     BITGRAIN_ERR_PANIC = 100
 };
 
+/* Quantization dithering modes for bitgrain_set_dither(). */
+enum {
+    BITGRAIN_DITHER_OFF = 0,
+    BITGRAIN_DITHER_ORDERED = 1,
+    BITGRAIN_DITHER_ERROR_DIFFUSION = 2
+};
+
 /*
  * Encode a grayscale image (8 bpp) to .bg stream.
  * quality: 1–100 (higher = less quantization), 0 = default 85.
@@ -62,6 +69,20 @@ int bitgrain_encode_rgba(
  * Returns 0 on success, -1 on invalid value or late/failed init.
  */
 int bitgrain_set_threads(int32_t threads);
+
+/*
+ * Configure quantization dithering for subsequent encode calls.
+ * mode: BITGRAIN_DITHER_OFF (0), BITGRAIN_DITHER_ORDERED (1) or
+ *       BITGRAIN_DITHER_ERROR_DIFFUSION (2).
+ * strength: perturbation percentage, 0..=100. strength 0 disables
+ *       dithering (output stays byte-identical to the undithered encoder);
+ *       values outside 0..=100 are rejected with BITGRAIN_ERR_INVALID_ARG.
+ * Returns 0 on success, -1 on invalid arguments. Applies process-wide.
+ */
+int bitgrain_set_dither(int mode, int strength);
+
+/* Reset dithering to the disabled default. Returns 0 on success. */
+int bitgrain_clear_dither(void);
 
 /*
  * Thread-local error status for API calls.
