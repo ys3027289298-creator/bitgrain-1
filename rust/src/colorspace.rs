@@ -1235,3 +1235,347 @@ pub fn ycbcr420a_to_rgba(y: &[u8], cb: &[u8], cr: &[u8], a: &[u8], w: usize, _h:
             .for_each(|(py, out_row)| decode_row(py, out_row));
     }
 }
+
+// ===========================================================================
+// Decal compositing: blend a decal image on top of a base image.
+//
+// Two separable blend modes are provided, computed per channel on normalized
+// components (x = base/255, y = decal/255):
+//
+//   screen(b, d)  = 1 - (1 - b) * (1 - d)
+//   overlay(b, d) = 2*b*d                 if b < 0.5
+//                   1 - 2*(1 - b)*(1 - d) otherwise
+//
+// A configurable strength s in [0.0, 1.0] interpolates the result between the
+// untouched base (s = 0) and the full blend (s = 1):
+//
+//   result = b + s * (blend(b, d) - b)
+//
+// Every output component is saturated-clamped to [0, 255]; values are never
+// reduced modulo 256, so overshoot truncates instead of wrapping around.
+// ===========================================================================
+
+/// Selects the separable blend function used when compositing a decal.
+///
+/// Validated tag type: only the two constants [`BlendMode::SCREEN`] and
+/// [`BlendMode::OVERLAY`] exist. Build values with [`BlendMode::from_code`],
+/// which rejects unknown codes with [`CompositeError::InvalidMode`], so an
+/// invalid mode is an explicit runtime error rather than undefined behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendMode(u8);
+
+impl BlendMode {
+    /// `1 - (1 - base) * (1 - decal)`: lightens the base (no pure darkening).
+    pub const SCREEN: BlendMode = BlendMode(0);
+    /// Multiply on dark base tones, screen on light base tones (increases contrast).
+    pub const OVERLAY: BlendMode = BlendMode(1);
+
+    /// Construct a mode from its wire code (`0` = screen, `1` = overlay).
+    /// Any other code is rejected as [`CompositeError::InvalidMode`].
+    pub fn from_code(code: u8) -> Result<BlendMode, CompositeError> {
+        match code {
+            0 => Ok(Self::SCREEN),
+            1 => Ok(Self::OVERLAY),
+            _ => Err(CompositeError::InvalidMode),
+        }
+    }
+
+    /// Numeric wire code of the mode.
+    pub fn code(self) -> u8 {
+        self.0
+    }
+}
+
+/// Failure conditions for [`composite_rgb`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompositeError {
+    /// Blend mode code was neither screen (0) nor overlay (1).
+    InvalidMode,
+    /// Strength was NaN or outside the closed range `[0.0, 1.0]`.
+    InvalidStrength,
+    /// Slice length did not match `width * height * 3`, or a dimension was zero.
+    InvalidGeometry,
+}
+
+impl core::fmt::Display for CompositeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CompositeError::InvalidMode => {
+                f.write_str("blend mode must be screen (0) or overlay (1)")
+            }
+            CompositeError::InvalidStrength => {
+                f.write_str("blend strength must be a finite value in [0.0, 1.0]")
+            }
+            CompositeError::InvalidGeometry => {
+                f.write_str("base and decal must share the same non-zero RGB dimensions")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompositeError {}
+
+#[inline]
+fn blend_channel(mode: BlendMode, base: f64, decal: f64) -> f64 {
+    match mode {
+        BlendMode::SCREEN => 1.0 - (1.0 - base) * (1.0 - decal),
+        BlendMode::OVERLAY => {
+            if base < 0.5 {
+                2.0 * base * decal
+            } else {
+                1.0 - 2.0 * (1.0 - base) * (1.0 - decal)
+            }
+        }
+        // Unreachable for values built via BlendMode::from_code; keep the
+        // total match exhaustive so an invalid tag can never blend silently.
+        _ => 0.0,
+    }
+}
+
+/// Saturated clamp to the 8-bit range: overshoot truncates at 255, undershoot
+/// at 0. Never wraps around (no `as u8` modulo behavior).
+#[inline]
+fn saturate_to_u8(value: f64) -> u8 {
+    if value <= 0.0 {
+        0
+    } else if value >= 255.0 {
+        255
+    } else {
+        (value + 0.5) as u8
+    }
+}
+
+/// Composite an RGB decal over an equally sized RGB base image.
+///
+/// Both buffers are interleaved `R G B` byte slices of `width * height * 3`.
+/// `strength` must be a finite value in `[0.0, 1.0]`; `0.0` returns a copy of
+/// the base unchanged. Returns [`CompositeError`] for an invalid strength or
+/// mismatched geometry without touching the output.
+pub fn composite_rgb(
+    base: &[u8],
+    decal: &[u8],
+    width: usize,
+    height: usize,
+    mode: BlendMode,
+    strength: f32,
+) -> Result<Vec<u8>, CompositeError> {
+    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+        return Err(CompositeError::InvalidStrength);
+    }
+    let expected = match width.checked_mul(height).and_then(|n| n.checked_mul(3)) {
+        Some(len) if len != 0 => len,
+        _ => return Err(CompositeError::InvalidGeometry),
+    };
+    if base.len() != expected || decal.len() != expected {
+        return Err(CompositeError::InvalidGeometry);
+    }
+
+    let strength = strength as f64;
+    let mut out = Vec::with_capacity(expected);
+    for (&b, &d) in base.iter().zip(decal.iter()) {
+        let base_norm = b as f64 / 255.0;
+        let decal_norm = d as f64 / 255.0;
+        let blended_norm = blend_channel(mode, base_norm, decal_norm);
+        let mixed_norm = base_norm + strength * (blended_norm - base_norm);
+        out.push(saturate_to_u8(mixed_norm * 255.0));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod blend_tests {
+    use super::*;
+
+    // Two fixed color pairs (base, decal), interleaved as RGB triplets.
+    const PAIR_A: ([u8; 3], [u8; 3]) = ([64u8, 128, 200], [200u8, 64, 240]);
+    const PAIR_B: ([u8; 3], [u8; 3]) = ([10u8, 200, 128], [250u8, 30, 0]);
+    const STRENGTH: f32 = 0.75;
+
+    /// Independent reference implementation of the hand-derived formulas,
+    /// kept separate from the production code path on purpose.
+    fn reference_blend(mode: BlendMode, base: u8, decal: u8, strength: f64) -> f64 {
+        let b = base as f64 / 255.0;
+        let d = decal as f64 / 255.0;
+        let blended = match mode {
+            BlendMode::SCREEN => 1.0 - (1.0 - b) * (1.0 - d),
+            BlendMode::OVERLAY => {
+                if b < 0.5 {
+                    2.0 * b * d
+                } else {
+                    1.0 - 2.0 * (1.0 - b) * (1.0 - d)
+                }
+            }
+            _ => unreachable!("tests only use BlendMode::SCREEN/OVERLAY"),
+        };
+        (b + strength * (blended - b)) * 255.0
+    }
+
+    fn rgb_of(pair: ([u8; 3], [u8; 3])) -> (Vec<u8>, Vec<u8>) {
+        (pair.0.to_vec(), pair.1.to_vec())
+    }
+
+    #[test]
+    fn fixed_colors_outputs_match_hand_formulas() {
+        let pairs = [PAIR_A, PAIR_B];
+        let mut max_abs_error = 0.0f64;
+        println!();
+        println!("== decal blend: fixed-color outputs vs hand formulas (strength = {STRENGTH}) ==");
+        for mode in [BlendMode::SCREEN, BlendMode::OVERLAY] {
+            for (index, pair) in pairs.iter().copied().enumerate() {
+                let (base, decal) = rgb_of(pair);
+                let got = composite_rgb(&base, &decal, 1, 1, mode, STRENGTH).unwrap();
+                let mut expected = [0u8; 3];
+                let mut errors = [0.0f64; 3];
+                for ch in 0..3 {
+                    let exact = reference_blend(mode, pair.0[ch], pair.1[ch], STRENGTH as f64);
+                    let clamped = exact.clamp(0.0, 255.0);
+                    expected[ch] = (clamped + 0.5) as u8;
+                    errors[ch] = (got[ch] as f64 - exact).abs();
+                    max_abs_error = max_abs_error.max(errors[ch]);
+                }
+                assert_eq!(got[..3], expected, "mode {mode:?} pair {index}");
+                println!(
+                    "{mode:?} pair{} base={:?} decal={:?} -> out={:?} hand={:?} |err|={:?}",
+                    index, pair.0, pair.1, got, expected, errors
+                );
+            }
+        }
+        // Rounding alone bounds the error against the exact real-valued formula.
+        assert!(
+            max_abs_error <= 0.5,
+            "max error {max_abs_error} exceeds 0.5 LSB"
+        );
+        println!("max |output - hand formula| over all channels = {max_abs_error} LSB");
+    }
+
+    #[test]
+    fn strength_zero_keeps_base_identical() {
+        let pairs = [PAIR_A, PAIR_B];
+        for mode in [BlendMode::SCREEN, BlendMode::OVERLAY] {
+            for pair in pairs {
+                let (base, decal) = rgb_of(pair);
+                let got = composite_rgb(&base, &decal, 1, 1, mode, 0.0).unwrap();
+                assert_eq!(got, base, "strength 0 must reproduce the base image");
+            }
+        }
+    }
+
+    #[test]
+    fn outputs_are_saturated_and_never_wrap() {
+        // Bright base + bright decal push screen/overlay above 255 in theory;
+        // the result must clamp to 255 instead of wrapping to a low value.
+        let base = vec![255u8, 250, 240];
+        let decal = vec![255u8, 255, 255];
+        for mode in [BlendMode::SCREEN, BlendMode::OVERLAY] {
+            let got = composite_rgb(&base, &decal, 1, 1, mode, 1.0).unwrap();
+            assert_eq!(got[0], 255);
+        }
+        // Dark-side clamp check for overlay's multiply branch.
+        let dark = composite_rgb(&[0u8, 0, 0], &[0, 0, 0], 1, 1, BlendMode::OVERLAY, 1.0).unwrap();
+        assert_eq!(dark, vec![0u8, 0, 0]);
+    }
+
+    #[test]
+    fn invalid_mode_or_strength_or_geometry_is_rejected() {
+        let (base, decal) = rgb_of(PAIR_A);
+        // Unknown mode codes are rejected; the two known codes are accepted.
+        assert_eq!(BlendMode::from_code(0), Ok(BlendMode::SCREEN));
+        assert_eq!(BlendMode::from_code(1), Ok(BlendMode::OVERLAY));
+        for bad_code in [2u8, 3, 255] {
+            assert_eq!(
+                BlendMode::from_code(bad_code),
+                Err(CompositeError::InvalidMode)
+            );
+        }
+        for bad in [f32::NAN, f32::INFINITY, -f32::INFINITY, -0.01, 1.01, 2.0] {
+            assert_eq!(
+                composite_rgb(&base, &decal, 1, 1, BlendMode::SCREEN, bad),
+                Err(CompositeError::InvalidStrength)
+            );
+        }
+        assert_eq!(
+            composite_rgb(&base, &decal, 0, 1, BlendMode::SCREEN, 0.5),
+            Err(CompositeError::InvalidGeometry)
+        );
+        assert_eq!(
+            composite_rgb(&base, &decal, 2, 1, BlendMode::OVERLAY, 0.5),
+            Err(CompositeError::InvalidGeometry)
+        );
+        assert_eq!(
+            composite_rgb(&base[..2], &decal, 1, 1, BlendMode::OVERLAY, 0.5),
+            Err(CompositeError::InvalidGeometry)
+        );
+    }
+
+    /// Deterministic codec-size proxy mirroring the .bg block pipeline
+    /// (8x8 blocks -> DCT -> scalar quantization -> run/value entropy coding),
+    /// implemented with the crate's pure-Rust test DCT so the test links
+    /// without the C accelerator objects. The absolute count is proxy-local;
+    /// the asserted property is the *relative* size change after blending.
+    fn encoded_bit_size(image: &[u8], w: usize, h: usize, channel: usize) -> usize {
+        use crate::blockizer::Blockizer;
+        use crate::dct::dct_reference;
+
+        let quant_table = crate::encoder::default_quant_table();
+        let mut blocks = Blockizer::new(w, h).generate_blocks_rgb(image, channel);
+        let mut total_bits = 0usize;
+        for block in blocks.iter_mut() {
+            block.data = dct_reference(block);
+            for coef in block.data.iter_mut() {
+                let step = quant_table[0].max(1) as i32;
+                *coef = (*coef as i32 / step) as i16;
+            }
+            // DC: 1 sign bit + magnitude bits; AC: zero-run + magnitude + sign.
+            total_bits += 1 + (16 - block.data[0].unsigned_abs().leading_zeros()) as usize;
+            for &coef in &block.data[1..] {
+                if coef == 0 {
+                    total_bits += 1; // zero symbol
+                } else {
+                    total_bits += 6; // run length (0..=63)
+                    total_bits += 1 + (16 - coef.unsigned_abs().leading_zeros()) as usize;
+                }
+            }
+        }
+        total_bits
+    }
+
+    #[test]
+    fn encoded_size_changes_after_blending() {
+        // Small self-made sample: 16x16 base (vertical gradient) and a
+        // high-frequency checkerboard decal. Blending reshapes DCT energy and
+        // therefore the codec's entropy-coded size.
+        const W: usize = 16;
+        const H: usize = 16;
+        let mut base = Vec::with_capacity(W * H * 3);
+        let mut decal = Vec::with_capacity(W * H * 3);
+        for y in 0..H {
+            for x in 0..W {
+                let v = ((x * 255) / (W - 1)) as u8;
+                base.extend_from_slice(&[v, v, v]);
+                let checker = if (x + y) % 2 == 0 { 255u8 } else { 0u8 };
+                decal.extend_from_slice(&[checker, checker, checker]);
+            }
+        }
+        // Sum the three color planes, as the real encoder does.
+        let size_of = |img: &[u8]| {
+            (0..3)
+                .map(|ch| encoded_bit_size(img, W, H, ch))
+                .sum::<usize>()
+        };
+        let base_size = size_of(&base);
+        println!();
+        println!("== codec entropy size proxy, bits (16x16 sample, all 3 planes) ==");
+        println!("base only:                {base_size} bits");
+        for mode in [BlendMode::SCREEN, BlendMode::OVERLAY] {
+            let blended = composite_rgb(&base, &decal, W, H, mode, STRENGTH).unwrap();
+            let blended_size = size_of(&blended);
+            let zero_size = size_of(&composite_rgb(&base, &decal, W, H, mode, 0.0).unwrap());
+            println!(
+                "{mode:?} strength {STRENGTH}: {blended_size} bits (delta {:+})",
+                blended_size as isize - base_size as isize
+            );
+            assert_ne!(blended_size, base_size, "blending must change encoded size");
+            assert_eq!(zero_size, base_size, "strength 0 must encode identically");
+        }
+    }
+}
