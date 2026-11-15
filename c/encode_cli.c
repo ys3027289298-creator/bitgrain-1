@@ -85,7 +85,8 @@ int encode_cli_run(const cli_ctx_t *ctx)
         uint8_t *pixels = load_image(cur_in, &width, &height, &channels, sbuf, slen);
 
         if (!pixels) {
-            fprintf(stderr, "Error: could not load '%s'.\n", cur_in);
+            fprintf(stderr, "Error: could not load '%s': %s\n",
+                    cur_in, bitgrain_image_last_error());
             free(cur_out_owned);
             enc_failed = 1;
             if (!ctx->multi) break;

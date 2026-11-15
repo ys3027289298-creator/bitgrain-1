@@ -151,6 +151,13 @@ bitgrain/
 
 Tests: `./tests/integration.sh` (requiere build previo con libwebp).
 
+WebP reader checks (lossy VP8 + lossless VP8L, alpha preservation, bounded
+decode error, failure messages, timings; builds its own tiny samples):
+
+```bash
+./tests/webp/run.sh
+```
+
 ## Formato .bg e interoperabilidad
 
 Especificación pública en [FORMAT.md](FORMAT.md). Permite implementar lectores/escritores .bg en terceros.

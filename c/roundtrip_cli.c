@@ -149,7 +149,8 @@ int roundtrip_cli_run(const cli_ctx_t *ctx)
         uint32_t width = 0, height = 0, channels = 0;
         uint8_t *pixels = load_image(cur_in, sbuf, slen, &width, &height, &channels);
         if (!pixels) {
-            fprintf(stderr, "Error: could not load '%s'.\n", cur_in);
+            fprintf(stderr, "Error: could not load '%s': %s\n",
+                    cur_in, bitgrain_image_last_error());
             free(cur_out_owned);
             rt_failed = 1;
             if (!ctx->multi) break;

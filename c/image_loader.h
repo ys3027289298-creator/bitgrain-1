@@ -51,6 +51,10 @@ uint8_t *bitgrain_load_rgba_mem(const uint8_t *mem, size_t mem_size,
 
 void bitgrain_image_free(void *pixels);
 
+/* Thread-local reason for the most recent failed image load (internal layer).
+ * Never NULL; valid until the next loader call on the same thread. */
+const char *bitgrain_image_last_error(void);
+
 #ifdef __cplusplus
 }
 #endif
