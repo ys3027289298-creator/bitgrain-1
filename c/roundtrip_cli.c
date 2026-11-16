@@ -56,8 +56,8 @@ static int write_output(const char *cur_out, int use_stdout,
         return bitgrain_write_tga(cur_out, decoded, width, height, (int)channels) == 0;
     if (len >= 5 && strcmp(cur_out + len - 5, ".webp") == 0)
         return bitgrain_write_webp(cur_out, decoded, width, height, (int)channels, jpeg_quality) == 0;
-    if (channels == 1)
-        return bitgrain_write_pgm(cur_out, decoded, width, height) == 0;
+    if (channels == 1 || channels == 3 || channels == 4)
+        return bitgrain_write_pgm_planes(cur_out, decoded, width, height, channels) == 0;
     return 0;
 }
 
