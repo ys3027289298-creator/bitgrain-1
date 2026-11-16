@@ -647,3 +647,1016 @@ pub fn encode_rgba_rle(
     write_icc_trailer(out, pos, icc);
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive spatial prediction (per block)
+//
+// The fixed predictors in the paths above assume one model for the whole
+// image, which is unfriendly to heterogeneous material. This additive path
+// works on n×n pixel blocks and picks, per block, the predictor with the
+// smallest residual energy among a caller-provided set:
+//
+//   * horizontal: replicate the reconstructed left boundary column
+//   * vertical:   replicate the reconstructed top boundary row
+//   * average:    mean of both boundaries (fallbacks at image edges)
+//
+// The choice is written as a 1-byte block header in front of the block's
+// coefficient payload, so the decoder follows exactly the header. Residuals
+// are DCT-coded with the existing quality-scaled luma quantizer and a
+// generalized zigzag/RLE layout. The encoder reconstructs every block
+// (dequant + IDCT + prediction) before moving on, which keeps its predictor
+// inputs bit-identical to the decoder's.
+//
+// Self-contained by design: no changes to the historical encode paths, no
+// new dependencies, and its own version byte (0x81) that older decoders
+// reject instead of mis-parsing. Grayscale only; the same routine applies to
+// each luma/alpha plane independently.
+//
+// Stream layout:
+//   "BG" | version 0x81 | width u32 LE | height u32 LE | quality u8 | block u8
+//   then, per block in raster order: predictor u8, DC i16 LE,
+//   then (run u8, level i16 LE) pairs, EOB = 0xFF 0x00 0x00.
+// ---------------------------------------------------------------------------
+
+/// Version byte of the adaptive-prediction grayscale stream (outside 1..=19).
+pub const PRED_VERSION: u8 = 0x81;
+
+/// Block sizes accepted by the adaptive-prediction path.
+pub const PRED_ALLOWED_BLOCK_SIZES: [usize; 3] = [4, 8, 16];
+
+/// Predictor codes carried by each block header.
+pub const PRED_HORIZONTAL: u8 = 0;
+pub const PRED_VERTICAL: u8 = 1;
+pub const PRED_AVERAGE: u8 = 2;
+
+/// Predictors accepted by the adaptive-prediction path.
+pub const PRED_ALLOWED_PREDICTORS: [u8; 3] = [PRED_HORIZONTAL, PRED_VERTICAL, PRED_AVERAGE];
+
+/// 12-byte .bg header plus the 1-byte block-size field.
+pub const PRED_HEADER_SIZE: usize = BG_HEADER_SIZE + 1;
+
+const PRED_FRAC_1_SQRT2: f64 = 0.7071067811865476;
+
+/// Result of an adaptive-prediction encode pass.
+#[derive(Debug)]
+pub struct PredictiveEncode {
+    /// Complete .bg stream.
+    pub stream: Vec<u8>,
+    /// Bytes spent on per-block headers (1 byte each).
+    pub header_bytes: usize,
+    /// Coefficient payload bytes (stream minus file header minus block headers).
+    pub payload_bytes: usize,
+    /// Number of coded blocks.
+    pub blocks: usize,
+    /// Block edge length used.
+    pub block_size: usize,
+    /// Per-predictor block counts, indexed by predictor code (0/1/2).
+    pub predictor_counts: [usize; 3],
+    /// Predictor chosen for each block, in raster order (the block-header bytes).
+    pub predictor_sequence: Vec<u8>,
+    /// Encoder-side reconstruction, byte-identical to what the decoder produces.
+    pub reconstruction: Vec<u8>,
+}
+
+/// Result of an adaptive-prediction decode pass.
+#[derive(Debug)]
+pub struct PredictiveDecode {
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    pub quality: u8,
+    pub block_size: usize,
+    pub blocks: usize,
+    /// Bytes consumed by per-block headers.
+    pub header_bytes: usize,
+    /// Per-predictor block counts as read from the block headers.
+    pub predictor_counts: [usize; 3],
+    /// Predictor read from each block header, in raster order.
+    pub predictor_sequence: Vec<u8>,
+}
+
+fn pred_validate_block_size(block_size: usize) -> Result<(), String> {
+    if PRED_ALLOWED_BLOCK_SIZES.contains(&block_size) {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid block size {block_size}: allowed sizes are {:?}",
+            PRED_ALLOWED_BLOCK_SIZES
+        ))
+    }
+}
+
+/// Validate the caller's predictor set. Must be a non-empty set drawn from
+/// {horizontal, vertical, average}; duplicates are rejected. Returns the
+/// normalized (ascending, duplicate-free) set for deterministic tie-breaks.
+fn pred_validate_predictors(predictors: &[u8]) -> Result<Vec<u8>, String> {
+    if predictors.is_empty() {
+        return Err(format!(
+            "invalid predictor set: empty (allowed predictors are {:?})",
+            PRED_ALLOWED_PREDICTORS
+        ));
+    }
+    let mut set = predictors.to_vec();
+    set.sort_unstable();
+    for pair in set.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(format!(
+                "invalid predictor set {predictors:?}: duplicate predictor {}",
+                pair[0]
+            ));
+        }
+    }
+    for &p in &set {
+        if !PRED_ALLOWED_PREDICTORS.contains(&p) {
+            return Err(format!(
+                "invalid predictor set {predictors:?}: predictor {p} not supported (allowed predictors are {:?})",
+                PRED_ALLOWED_PREDICTORS
+            ));
+        }
+    }
+    Ok(set)
+}
+
+/// JPEG diagonal (zigzag) order for an n×n block.
+fn pred_zigzag(n: usize) -> Vec<usize> {
+    let mut order = Vec::with_capacity(n * n);
+    for s in 0..(2 * n - 1) {
+        let lo = s.saturating_sub(n - 1);
+        let hi = s.min(n - 1);
+        if s % 2 == 0 {
+            for y in (lo..=hi).rev() {
+                order.push(y * n + (s - y));
+            }
+        } else {
+            for y in lo..=hi {
+                order.push(y * n + (s - y));
+            }
+        }
+    }
+    order
+}
+
+/// Quality-scaled luma quant table for an n×n block (nearest expansion of the
+/// standard 8×8 table). n == 8 returns the exact historical table.
+fn pred_quant_table(quality: u8, n: usize) -> Vec<i16> {
+    let t8 = quant_table_for_quality(quality);
+    if n == 8 {
+        return t8.to_vec();
+    }
+    let mut table = vec![0i16; n * n];
+    for y in 0..n {
+        for x in 0..n {
+            let sy = (y * 8 / n).min(7);
+            let sx = (x * 8 / n).min(7);
+            table[y * n + x] = t8[sy * 8 + sx];
+        }
+    }
+    table
+}
+
+/// Precomputed cosine table: `cs[u * n + x] = cos((2x+1)uπ / 2n)`.
+fn pred_cos_table(n: usize) -> Vec<f64> {
+    let mut cs = vec![0f64; n * n];
+    for u in 0..n {
+        for x in 0..n {
+            cs[u * n + x] =
+                ((2 * x + 1) as f64 * u as f64 * std::f64::consts::PI / (2.0 * n as f64)).cos();
+        }
+    }
+    cs
+}
+
+/// Generic separable n×n DCT-II (2/N normalization, cu = 1/√2 at DC).
+fn pred_dct(pixels: &[f64], n: usize, cs: &[f64]) -> Vec<f64> {
+    let scale = 2.0 / n as f64;
+    let mut out = vec![0f64; n * n];
+    for v in 0..n {
+        let cv = if v == 0 { PRED_FRAC_1_SQRT2 } else { 1.0 };
+        for u in 0..n {
+            let cu = if u == 0 { PRED_FRAC_1_SQRT2 } else { 1.0 };
+            let mut sum = 0.0f64;
+            for y in 0..n {
+                let cy = cs[v * n + y];
+                let row = y * n;
+                for x in 0..n {
+                    sum += pixels[row + x] * cs[u * n + x] * cy;
+                }
+            }
+            out[v * n + u] = scale * cu * cv * sum;
+        }
+    }
+    out
+}
+
+/// Generic separable n×n inverse DCT-II. Takes dequantized i32 coefficients
+/// so that large quality-1 steps cannot overflow.
+fn pred_idct(coefs: &[i32], n: usize, cs: &[f64]) -> Vec<f64> {
+    let scale = 2.0 / n as f64;
+    let mut out = vec![0f64; n * n];
+    for y in 0..n {
+        for x in 0..n {
+            let mut sum = 0.0f64;
+            for v in 0..n {
+                let cv = if v == 0 { PRED_FRAC_1_SQRT2 } else { 1.0 };
+                let cy = cs[v * n + y];
+                let row = v * n;
+                for u in 0..n {
+                    let cu = if u == 0 { PRED_FRAC_1_SQRT2 } else { 1.0 };
+                    sum += cu * cv * coefs[row + u] as f64 * cs[u * n + x] * cy;
+                }
+            }
+            out[y * n + x] = scale * sum;
+        }
+    }
+    out
+}
+
+#[inline]
+fn pred_quantize(coefs: &mut [i16], table: &[i16]) {
+    for (c, &t) in coefs.iter_mut().zip(table.iter()) {
+        let t = t.max(1) as i32;
+        let v = *c as i32;
+        let rounded = if v >= 0 { (v + t / 2) / t } else { -((-v + t / 2) / t) };
+        *c = rounded.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    }
+}
+
+fn pred_dequantize(coefs: &[i16], table: &[i16]) -> Vec<i32> {
+    coefs
+        .iter()
+        .zip(table.iter())
+        .map(|(&c, &t)| c as i32 * t.max(1) as i32)
+        .collect()
+}
+
+/// Sample an n×n block of raw 0..255 samples, edge-replicated.
+fn pred_original_block(
+    image: &[u8],
+    w: usize,
+    h: usize,
+    bx: usize,
+    by: usize,
+    n: usize,
+) -> Vec<i16> {
+    let mut out = vec![0i16; n * n];
+    for y in 0..n {
+        let iy = (by + y).min(h - 1);
+        let row = iy * w;
+        for x in 0..n {
+            let ix = (bx + x).min(w - 1);
+            out[y * n + x] = image[row + ix] as i16;
+        }
+    }
+    out
+}
+
+/// Prediction field for one block, built only from reconstructed pixels
+/// outside the block (left boundary column and top boundary row). This keeps
+/// the field decodable before the block's own coefficients are inverse
+/// transformed. Edge fallbacks are deterministic and mirrored by the decoder.
+fn pred_predict_block(
+    predictor: u8,
+    recon: &[u8],
+    w: usize,
+    h: usize,
+    bx: usize,
+    by: usize,
+    n: usize,
+) -> Vec<i16> {
+    let has_left = bx > 0;
+    let has_top = by > 0;
+
+    let mut left = vec![0i16; n];
+    if has_left {
+        for y in 0..n {
+            let iy = (by + y).min(h - 1);
+            left[y] = recon[iy * w + (bx - 1)] as i16;
+        }
+    }
+    let mut top = vec![0i16; n];
+    if has_top {
+        let ty = by - 1;
+        for x in 0..n {
+            let ix = (bx + x).min(w - 1);
+            top[x] = recon[ty * w + ix] as i16;
+        }
+    }
+
+    let mut field = vec![0i16; n * n];
+    for y in 0..n {
+        for x in 0..n {
+            field[y * n + x] = match predictor {
+                PRED_VERTICAL => {
+                    if has_top {
+                        top[x]
+                    } else if has_left {
+                        left[y]
+                    } else {
+                        128
+                    }
+                }
+                PRED_AVERAGE => {
+                    if has_left && has_top {
+                        ((left[y] as i32 + top[x] as i32 + 1) >> 1) as i16
+                    } else if has_left {
+                        left[y]
+                    } else if has_top {
+                        top[x]
+                    } else {
+                        128
+                    }
+                }
+                // PRED_HORIZONTAL (validated set; default keeps the field total).
+                _ => {
+                    if has_left {
+                        left[y]
+                    } else if has_top {
+                        top[x]
+                    } else {
+                        128
+                    }
+                }
+            };
+        }
+    }
+    field
+}
+
+#[inline]
+fn pred_energy(orig: &[i16], field: &[i16]) -> u64 {
+    orig.iter()
+        .zip(field.iter())
+        .map(|(&o, &p)| {
+            let d = o as i64 - p as i64;
+            (d * d) as u64
+        })
+        .sum()
+}
+
+/// Generalizes the historical RLE layout to n×n blocks. Same wire shape:
+/// DC i16 LE, (run u8, level i16 LE) pairs, EOB = 0xFF 0x00 0x00.
+fn pred_write_block(coefs: &[i16], order: &[usize], out: &mut Vec<u8>) {
+    out.extend_from_slice(&coefs[order[0]].to_le_bytes());
+    let mut run: u8 = 0;
+    for &idx in &order[1..] {
+        let level = coefs[idx];
+        if level == 0 {
+            if run == 0xFE {
+                out.push(0xFE);
+                out.extend_from_slice(&0i16.to_le_bytes());
+                run = 0;
+            }
+            run += 1;
+        } else {
+            out.push(run);
+            out.extend_from_slice(&level.to_le_bytes());
+            run = 0;
+        }
+    }
+    out.push(0xFF);
+    out.extend_from_slice(&0i16.to_le_bytes());
+}
+
+fn pred_read_block(
+    stream: &[u8],
+    pos: &mut usize,
+    count: usize,
+    order: &[usize],
+) -> Result<Vec<i16>, String> {
+    let mut coefs = vec![0i16; count];
+    if *pos + 2 > stream.len() {
+        return Err("corrupt predictive stream: truncated DC coefficient".to_string());
+    }
+    coefs[order[0]] = i16::from_le_bytes([stream[*pos], stream[*pos + 1]]);
+    *pos += 2;
+
+    let mut zi = 1usize;
+    loop {
+        if *pos + 3 > stream.len() {
+            return Err("corrupt predictive stream: truncated RLE pair".to_string());
+        }
+        let run = stream[*pos];
+        let level = i16::from_le_bytes([stream[*pos + 1], stream[*pos + 2]]);
+        *pos += 3;
+        if run == 0xFF && level == 0 {
+            break;
+        }
+        if run == 0xFE && level == 0 {
+            zi += 0xFE;
+            if zi > count {
+                return Err("corrupt predictive stream: coefficient overrun".to_string());
+            }
+            continue;
+        }
+        zi += run as usize;
+        if zi >= count {
+            return Err("corrupt predictive stream: coefficient overrun".to_string());
+        }
+        coefs[order[zi]] = level;
+        zi += 1;
+    }
+    Ok(coefs)
+}
+
+/// Shared reconstruction step used by both encoder and decoder so predictor
+/// inputs stay bit-identical: dequantize, IDCT, add prediction, clamp, store.
+#[allow(clippy::too_many_arguments)]
+fn pred_reconstruct_block(
+    coefs: &[i16],
+    table: &[i16],
+    field: &[i16],
+    n: usize,
+    cs: &[f64],
+    recon: &mut [u8],
+    w: usize,
+    h: usize,
+    bx: usize,
+    by: usize,
+) {
+    let dequant = pred_dequantize(coefs, table);
+    let pixels = pred_idct(&dequant, n, cs);
+    for y in 0..n {
+        let py = by + y;
+        if py >= h {
+            continue;
+        }
+        for x in 0..n {
+            let px = bx + x;
+            if px >= w {
+                continue;
+            }
+            let v = pixels[y * n + x].round() as i32 + field[y * n + x] as i32;
+            recon[py * w + px] = v.clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// Encode a grayscale image with per-block adaptive spatial prediction.
+///
+/// `block_size` must be one of `PRED_ALLOWED_BLOCK_SIZES`; `predictors` must be
+/// a non-empty duplicate-free subset of `PRED_ALLOWED_PREDICTORS`. Either
+/// violation returns `Err` and nothing is written.
+pub fn encode_grayscale_predictive(
+    image: &[u8],
+    width: usize,
+    height: usize,
+    quality: u8,
+    block_size: usize,
+    predictors: &[u8],
+) -> Result<PredictiveEncode, String> {
+    pred_validate_block_size(block_size)?;
+    let set = pred_validate_predictors(predictors)?;
+    if width == 0 || height == 0 || width > 65536 || height > 65536 {
+        return Err(format!("invalid image dimensions {width}x{height}"));
+    }
+    let pixels = width
+        .checked_mul(height)
+        .ok_or_else(|| format!("invalid image dimensions {width}x{height}: overflow"))?;
+    if image.len() < pixels {
+        return Err(format!(
+            "invalid image buffer: {} bytes for {width}x{height}",
+            image.len()
+        ));
+    }
+
+    let q = if quality == 0 { 50 } else { quality.clamp(1, 100) };
+    let n = block_size;
+    let table = pred_quant_table(q, n);
+    let order = pred_zigzag(n);
+    let cs = pred_cos_table(n);
+    let bw = (width + n - 1) / n;
+    let bh = (height + n - 1) / n;
+
+    let mut stream = Vec::with_capacity(PRED_HEADER_SIZE + bw * bh * 8);
+    stream.extend_from_slice(b"BG");
+    stream.push(PRED_VERSION);
+    stream.extend_from_slice(&(width as u32).to_le_bytes());
+    stream.extend_from_slice(&(height as u32).to_le_bytes());
+    stream.push(q);
+    stream.push(n as u8);
+
+    let mut recon = vec![0u8; pixels];
+    let mut counts = [0usize; 3];
+    let mut predictor_sequence = Vec::with_capacity(bw * bh);
+
+    for byi in 0..bh {
+        for bxi in 0..bw {
+            let bx = bxi * n;
+            let by = byi * n;
+            let orig = pred_original_block(image, width, height, bx, by, n);
+
+            // Pick the candidate with the smallest spatial residual energy.
+            // `set` is ascending, so ties deterministically keep the lowest code.
+            let mut chosen = set[0];
+            let mut field = pred_predict_block(chosen, &recon, width, height, bx, by, n);
+            let mut best_energy = pred_energy(&orig, &field);
+            for &candidate in &set[1..] {
+                let candidate_field =
+                    pred_predict_block(candidate, &recon, width, height, bx, by, n);
+                let energy = pred_energy(&orig, &candidate_field);
+                if energy < best_energy {
+                    best_energy = energy;
+                    chosen = candidate;
+                    field = candidate_field;
+                }
+            }
+
+            counts[chosen as usize] += 1;
+            predictor_sequence.push(chosen);
+            stream.push(chosen); // block header
+
+            let mut residual = vec![0f64; n * n];
+            for i in 0..n * n {
+                residual[i] = orig[i] as f64 - field[i] as f64;
+            }
+            let transformed = pred_dct(&residual, n, &cs);
+            let mut coefs: Vec<i16> = transformed
+                .iter()
+                .map(|v| v.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16)
+                .collect();
+            pred_quantize(&mut coefs, &table);
+            pred_write_block(&coefs, &order, &mut stream);
+
+            // Reconstruct immediately: the next block's prediction reads it.
+            pred_reconstruct_block(
+                &coefs, &table, &field, n, &cs, &mut recon, width, height, bx, by,
+            );
+        }
+    }
+
+    let blocks = bw * bh;
+    let payload_bytes = stream.len() - PRED_HEADER_SIZE - blocks;
+    Ok(PredictiveEncode {
+        stream,
+        header_bytes: blocks,
+        payload_bytes,
+        blocks,
+        block_size: n,
+        predictor_counts: counts,
+        predictor_sequence,
+        reconstruction: recon,
+    })
+}
+
+/// Decode a stream produced by `encode_grayscale_predictive`.
+/// Every block follows its own 1-byte predictor header; malformed headers,
+/// block sizes and truncated payloads return `Err`.
+pub fn decode_grayscale_predictive(stream: &[u8]) -> Result<PredictiveDecode, String> {
+    if stream.len() < PRED_HEADER_SIZE {
+        return Err("not a predictive stream: too short".to_string());
+    }
+    if &stream[0..2] != b"BG" || stream[2] != PRED_VERSION {
+        return Err(format!(
+            "not a predictive stream (version {:#04x}, expected {:#04x})",
+            stream[2], PRED_VERSION
+        ));
+    }
+    let width = u32::from_le_bytes([stream[3], stream[4], stream[5], stream[6]]) as usize;
+    let height = u32::from_le_bytes([stream[7], stream[8], stream[9], stream[10]]) as usize;
+    let quality = if stream[11] == 0 { 50 } else { stream[11].clamp(1, 100) };
+    let n = stream[12] as usize;
+    pred_validate_block_size(n).map_err(|_| {
+        format!(
+            "corrupt predictive stream: invalid block size {n} (allowed sizes are {:?})",
+            PRED_ALLOWED_BLOCK_SIZES
+        )
+    })?;
+    if width == 0 || height == 0 || width > 65536 || height > 65536 {
+        return Err(format!("corrupt predictive stream: invalid dimensions {width}x{height}"));
+    }
+    let pixels = width
+        .checked_mul(height)
+        .ok_or_else(|| "corrupt predictive stream: dimension overflow".to_string())?;
+
+    let table = pred_quant_table(quality, n);
+    let order = pred_zigzag(n);
+    let cs = pred_cos_table(n);
+    let bw = (width + n - 1) / n;
+    let bh = (height + n - 1) / n;
+    let blocks = bw * bh;
+
+    let mut recon = vec![0u8; pixels];
+    let mut counts = [0usize; 3];
+    let mut predictor_sequence = Vec::with_capacity(blocks);
+    let mut pos = PRED_HEADER_SIZE;
+
+    for byi in 0..bh {
+        for bxi in 0..bw {
+            if pos >= stream.len() {
+                return Err("corrupt predictive stream: missing block header".to_string());
+            }
+            let predictor = stream[pos];
+            pos += 1;
+            if predictor > PRED_AVERAGE {
+                return Err(format!(
+                    "corrupt predictive stream: invalid predictor {predictor} in block header \
+                     (allowed predictors are {:?})",
+                    PRED_ALLOWED_PREDICTORS
+                ));
+            }
+            counts[predictor as usize] += 1;
+            predictor_sequence.push(predictor);
+
+            let coefs = pred_read_block(stream, &mut pos, n * n, &order)?;
+            let bx = bxi * n;
+            let by = byi * n;
+            let field = pred_predict_block(predictor, &recon, width, height, bx, by, n);
+            pred_reconstruct_block(
+                &coefs, &table, &field, n, &cs, &mut recon, width, height, bx, by,
+            );
+        }
+    }
+
+    Ok(PredictiveDecode {
+        pixels: recon,
+        width,
+        height,
+        quality,
+        block_size: n,
+        blocks,
+        header_bytes: blocks,
+        predictor_counts: counts,
+        predictor_sequence,
+    })
+}
+
+
+#[cfg(test)]
+mod predictive_tests {
+    use super::*;
+
+    /// Deterministic xorshift64* PRNG so samples need no external files.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn range(&mut self, lo: i32, hi: i32) -> i32 {
+            lo + (self.next() % ((hi - lo + 1) as u64)) as i32
+        }
+    }
+
+    /// Material A: photo-like smooth shading with gentle texture. No single
+    /// prediction direction dominates across the whole image.
+    fn sample_photo(w: usize, h: usize) -> Vec<u8> {
+        let (wf, hf) = (w as f64, h as f64);
+        (0..h)
+            .flat_map(|y| {
+                (0..w).map(move |x| {
+                    let fx = x as f64 / wf.max(1.0);
+                    let fy = y as f64 / hf.max(1.0);
+                    let v = 110.0
+                        + 60.0 * (5.0 * fx + 1.0).sin()
+                        + 40.0 * (4.0 * fy + 0.3).cos()
+                        + 18.0 * (13.0 * (fx + fy)).sin();
+                    v.clamp(0.0, 255.0) as u8
+                })
+            })
+            .collect()
+    }
+
+    /// Material B: screen-capture / graphics. Flat panels, sharp horizontal
+    /// separators and vertical strokes, so orientation flips between blocks.
+    fn sample_screen(w: usize, h: usize) -> Vec<u8> {
+        (0..h)
+            .flat_map(|y| {
+                (0..w).map(move |x| {
+                    let panel = ((x / 24) + (y / 24)) % 2;
+                    let mut v: i32 = if panel == 0 { 232 } else { 28 };
+                    if x % 24 == 0 || y % 24 == 0 {
+                        v = 96; // separators: both orientations present
+                    }
+                    if (x / 4) % 9 == 0 && (y / 3) % 7 == 0 {
+                        v = v.saturating_sub(40); // stroke texture
+                    }
+                    v as u8
+                })
+            })
+            .collect()
+    }
+
+    /// Material C: four quadrants with different dominant orientations
+    /// (vertical stripes / horizontal bands / diagonal ramp / flat).
+    fn sample_mixed(w: usize, h: usize) -> Vec<u8> {
+        (0..h)
+            .flat_map(|y| {
+                (0..w).map(move |x| {
+                    let left = x < w / 2;
+                    let top = y < h / 2;
+                    match (left, top) {
+                        (true, true) => ((x * 9) % 256) as u8,
+                        (false, true) => ((y * 9) % 256) as u8,
+                        (true, false) => (((x + y) * 4) % 256) as u8,
+                        (false, false) => 90,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Material D: deterministic noise floor (worst case, no structure).
+    fn sample_noise(w: usize, h: usize) -> Vec<u8> {
+        let mut rng = Rng(0xDEADBEEFCAFEF00D);
+        (0..w * h)
+            .map(|_| (128 + rng.range(-60, 60)).clamp(0, 255) as u8)
+            .collect()
+    }
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        let mse = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| {
+                let d = x as f64 - y as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / a.len() as f64;
+        if mse == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (255.0f64 * 255.0 / mse).log10()
+        }
+    }
+
+    #[test]
+    fn predictive_rejects_invalid_block_sizes() {
+        let img = sample_mixed(32, 32);
+        for size in [0usize, 1, 2, 3, 5, 7, 9, 12, 24, 32, 64] {
+            let err = encode_grayscale_predictive(&img, 32, 32, 50, size, &[0, 1, 2])
+                .err()
+                .unwrap_or_else(|| panic!("block size {size} must be rejected"));
+            assert!(err.contains("invalid block size"), "{err}");
+        }
+        for size in PRED_ALLOWED_BLOCK_SIZES {
+            assert!(
+                encode_grayscale_predictive(&img, 32, 32, 50, size, &[0, 1, 2]).is_ok(),
+                "block size {size} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn predictive_rejects_invalid_predictor_sets() {
+        let img = sample_mixed(24, 24);
+        for set in [
+            &[][..],
+            &[3][..],
+            &[9][..],
+            &[0, 0][..],
+            &[1, 1, 2][..],
+            &[0, 1, 2, 3][..],
+            &[255][..],
+        ] {
+            let err = encode_grayscale_predictive(&img, 24, 24, 50, 8, set)
+                .err()
+                .unwrap_or_else(|| panic!("predictor set {set:?} must be rejected"));
+            assert!(err.contains("invalid predictor set"), "{err}");
+        }
+        for set in [
+            &[0][..],
+            &[1][..],
+            &[2][..],
+            &[0, 1, 2][..],
+            &[2, 0][..],
+            &[2, 1, 0][..],
+        ] {
+            assert!(
+                encode_grayscale_predictive(&img, 24, 24, 50, 8, set).is_ok(),
+                "predictor set {set:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn predictive_roundtrip_all_materials_and_sizes() {
+        let dims = [(1usize, 1usize), (7, 5), (16, 16), (37, 23), (64, 48)];
+        let materials: [(&str, fn(usize, usize) -> Vec<u8>); 4] = [
+            ("photo", sample_photo),
+            ("screen", sample_screen),
+            ("mixed", sample_mixed),
+            ("noise", sample_noise),
+        ];
+        for (name, make) in materials {
+            for &(w, h) in &dims {
+                let img = make(w, h);
+                for &n in &PRED_ALLOWED_BLOCK_SIZES {
+                    for set in [&[0, 1, 2][..], &[0][..], &[1][..], &[2][..], &[0, 2][..]] {
+                        let enc = encode_grayscale_predictive(&img, w, h, 85, n, set).unwrap();
+                        let dec = decode_grayscale_predictive(&enc.stream).unwrap();
+                        assert_eq!((dec.width, dec.height), (w, h), "{name} {w}x{h} n={n}");
+                        assert_eq!(dec.pixels.len(), w * h);
+                        assert_eq!(dec.blocks, enc.blocks);
+                        assert_eq!(
+                            dec.predictor_sequence, enc.predictor_sequence,
+                            "{name} {w}x{h} n={n} set={set:?}: decoder must follow block headers"
+                        );
+                        assert_eq!(dec.predictor_counts, enc.predictor_counts);
+                        // Within the chosen set: no header may point outside it.
+                        for &p in &dec.predictor_sequence {
+                            assert!(set.contains(&p), "header predictor {p} outside set {set:?}");
+                        }
+                        let p = psnr(&img, &dec.pixels);
+                        assert!(p > 18.0, "{name} {w}x{h} n={n} set={set:?} PSNR {p:.2} dB");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tie-break and coarse semantics: with a single predictor the headers must
+    /// all carry it; with all three, the chosen one must never lose to another
+    /// candidate on spatial residual energy.
+    #[test]
+    fn predictive_single_predictor_headers_and_energy_choice() {
+        let (w, h, n) = (48usize, 40usize, 8usize);
+        let img = sample_photo(w, h);
+        for p in PRED_ALLOWED_PREDICTORS {
+            let enc = encode_grayscale_predictive(&img, w, h, 80, n, &[p]).unwrap();
+            assert!(enc.predictor_sequence.iter().all(|&x| x == p));
+            assert_eq!(enc.predictor_counts[p as usize], enc.blocks);
+        }
+        let enc = encode_grayscale_predictive(&img, w, h, 80, n, &[0, 1, 2]).unwrap();
+        assert_eq!(enc.predictor_sequence.len(), enc.blocks);
+    }
+
+    #[test]
+    fn predictive_decoder_rejects_malformed_streams() {
+        let img = sample_screen(24, 24);
+        let enc = encode_grayscale_predictive(&img, 24, 24, 70, 8, &[0, 1, 2]).unwrap();
+
+        // Foreign (historical) stream must be rejected.
+        let mut legacy = enc.stream.clone();
+        legacy[2] = 19;
+        assert!(decode_grayscale_predictive(&legacy).is_err());
+
+        // Truncated stream.
+        let cut = enc.stream.len() - 1;
+        assert!(decode_grayscale_predictive(&enc.stream[..cut]).is_err());
+
+        // Illegal block size in the file header.
+        let mut bad_n = enc.stream.clone();
+        bad_n[12] = 3;
+        let err = decode_grayscale_predictive(&bad_n).unwrap_err();
+        assert!(err.contains("invalid block size"), "{err}");
+
+        // Illegal per-block predictor header (first block header at pos 13).
+        let mut bad_pred = enc.stream.clone();
+        bad_pred[PRED_HEADER_SIZE] = 7;
+        let err = decode_grayscale_predictive(&bad_pred).unwrap_err();
+        assert!(err.contains("invalid predictor"), "{err}");
+    }
+
+    /// The block header must be the energy-minimal predictor of the offered
+    /// set, using only boundary pixels that are final before the block is
+    /// coded. Since `reconstruction` is the final image and a block's field
+    /// reads only earlier pixels, recomputing the field from it reproduces the
+    /// encoder's decision exactly, so the argmin comparison is independent.
+    #[test]
+    fn predictive_headers_are_per_block_energy_argmin() {
+        let (w, h, q) = (96usize, 80usize, 85u8);
+        for (name, make) in [
+            ("photo", sample_photo as fn(usize, usize) -> Vec<u8>),
+            ("screen", sample_screen),
+            ("mixed", sample_mixed),
+        ] {
+            let img = make(w, h);
+            for n in PRED_ALLOWED_BLOCK_SIZES {
+                let enc = encode_grayscale_predictive(&img, w, h, q, n, &[0, 1, 2]).unwrap();
+                let bw = (w + n - 1) / n;
+                for (i, &chosen) in enc.predictor_sequence.iter().enumerate() {
+                    let bx = (i % bw) * n;
+                    let by = (i / bw) * n;
+                    let orig = pred_original_block(&img, w, h, bx, by, n);
+                    let mut energies = [0u64; 3];
+                    for p in PRED_ALLOWED_PREDICTORS {
+                        let field =
+                            pred_predict_block(p, &enc.reconstruction, w, h, bx, by, n);
+                        energies[p as usize] = pred_energy(&orig, &field);
+                    }
+                    let best = (0..3)
+                        .min_by_key(|&p| energies[p])
+                        .unwrap() as u8;
+                    assert_eq!(
+                        chosen, best,
+                        "{name} n={n} block {i}: header {chosen} but energies {:?}",
+                        energies
+                    );
+                }
+            }
+        }
+    }
+
+    /// A heterogeneous material must actually exercise more than one predictor,
+    /// otherwise "adaptive" would be a no-op.
+    #[test]
+    fn predictive_adapts_across_orientations() {
+        let (w, h, n) = (128usize, 128usize, 8usize);
+        let enc = encode_grayscale_predictive(&sample_mixed(w, h), w, h, 85, n, &[0, 1, 2])
+            .unwrap();
+        let used = enc.predictor_counts.iter().filter(|&&c| c > 0).count();
+        assert!(used >= 2, "expected a mixed predictor mix, got {:?}", enc.predictor_counts);
+        // And with a constrained set, only the allowed codes may appear.
+        let enc = encode_grayscale_predictive(&sample_mixed(w, h), w, h, 85, n, &[2]).unwrap();
+        assert!(enc.predictor_sequence.iter().all(|&p| p == 2));
+    }
+
+    #[test]
+    fn predictive_quality_and_block_size_are_carried_in_stream() {
+        let img = sample_photo(32, 32);
+        for q in [1u8, 25, 50, 85, 100] {
+            for n in PRED_ALLOWED_BLOCK_SIZES {
+                let enc = encode_grayscale_predictive(&img, 32, 32, q, n, &[0, 1, 2]).unwrap();
+                let dec = decode_grayscale_predictive(&enc.stream).unwrap();
+                assert_eq!(dec.quality, q);
+                assert_eq!(dec.block_size, n);
+                assert_eq!(enc.stream.len(), PRED_HEADER_SIZE + enc.blocks + enc.payload_bytes);
+            }
+        }
+    }
+
+    /// One-shot metrics table for the three material classes plus a noise
+    /// floor. For each material and block size it reports:
+    ///   * size: best single-predictor ("fixed") stream vs the adaptive stream
+    ///   * header cost: bytes and share of the adaptive stream
+    ///   * encode/decode wall time (adaptive pass only)
+    ///   * round-trip consistency: decoder headers == encoder headers and the
+    ///     decoded pixels match an independent replay (exact equality)
+    ///   * PSNR against the source, and the H/V/A block mix.
+    #[test]
+    fn predictive_metrics_report() {
+        let (w, h, quality) = (128usize, 128usize, 85u8);
+        println!();
+        println!("size = stream bytes; gain vs best single-predictor baseline;");
+        println!("hdr = per-block-header bytes and share of adaptive stream;");
+        println!("times are one encode/decode of adaptive stream on this host;");
+        println!("roundtrip = decode pixels == encoder reconstruction and headers match.");
+        println!();
+        println!("adv/raw = adaptive stream as % of uncompressed grayscale input;");
+        println!(
+            "material  n | fixed H/V/A bytes | adaptive bytes | adv/raw % | gain vs best fixed | hdr B (%) | enc ms | dec ms | PSNR dB | H/V/A blocks | roundtrip"
+        );
+        for (name, make) in [
+            ("photo   ", sample_photo as fn(usize, usize) -> Vec<u8>),
+            ("screen  ", sample_screen),
+            ("mixed   ", sample_mixed),
+            ("noise   ", sample_noise),
+        ] {
+            let img = make(w, h);
+            for n in PRED_ALLOWED_BLOCK_SIZES {
+                let mut fixed_sizes = [0usize; 3];
+                for (i, p) in PRED_ALLOWED_PREDICTORS.iter().enumerate() {
+                    fixed_sizes[i] = encode_grayscale_predictive(&img, w, h, quality, n, &[*p])
+                        .unwrap()
+                        .stream
+                        .len();
+                }
+                let best_fixed = *fixed_sizes.iter().min().unwrap();
+
+                let t0 = std::time::Instant::now();
+                let enc = encode_grayscale_predictive(&img, w, h, quality, n, &[0, 1, 2]).unwrap();
+                let enc_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+                let t1 = std::time::Instant::now();
+                let dec = decode_grayscale_predictive(&enc.stream).unwrap();
+                let dec_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+                // Round-trip consistency: the decoder must reproduce the
+                // encoder's own reconstruction exactly, and read back the same
+                // per-block headers in the same order.
+                let roundtrip_ok = dec.pixels == enc.reconstruction
+                    && dec.predictor_sequence == enc.predictor_sequence
+                    && dec.predictor_counts == enc.predictor_counts;
+
+                let gain =
+                    100.0 * (best_fixed as f64 - enc.stream.len() as f64) / best_fixed as f64;
+                let hdr = 100.0 * enc.header_bytes as f64 / enc.stream.len() as f64;
+                let adv_raw = 100.0 * enc.stream.len() as f64 / (w * h) as f64;
+                println!(
+                    "{name} {n:2} | {:5}/{:5}/{:5} | {:6} | {:5.2}% | {:+6.2}% | {:4} ({:4.2}%) | {:6.2} | {:6.2} | {:7.2} | {}/{}/{} | {}",
+                    fixed_sizes[0],
+                    fixed_sizes[1],
+                    fixed_sizes[2],
+                    enc.stream.len(),
+                    adv_raw,
+                    gain,
+                    enc.header_bytes,
+                    hdr,
+                    enc_ms,
+                    dec_ms,
+                    psnr(&img, &dec.pixels),
+                    enc.predictor_counts[0],
+                    enc.predictor_counts[1],
+                    enc.predictor_counts[2],
+                    if roundtrip_ok { "OK" } else { "MISMATCH" },
+                );
+                assert!(roundtrip_ok, "{name} n={n}: round-trip consistency failed");
+                assert!(psnr(&img, &dec.pixels) > 20.0, "{name} n={n} PSNR too low");
+            }
+        }
+    }
+}
