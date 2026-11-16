@@ -73,6 +73,7 @@ C_SRCS = \
 	c/encode_cli.c \
 	c/image_loader.c \
 	c/image_writer.c \
+	c/tiff_io.c \
 	c/icc_io.c \
 	c/platform.c \
 	c/metrics.c \

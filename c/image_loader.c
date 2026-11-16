@@ -1,5 +1,6 @@
 #include "image_loader.h"
 #include "webp_io.h"
+#include "tiff_io.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -48,6 +49,8 @@ uint8_t *bitgrain_load_grayscale(const char *path,
                                   uint32_t *out_width,
                                   uint32_t *out_height)
 {
+    if (bitgrain_tiff_probe_path(path))
+        return bitgrain_tiff_load(path, out_width, out_height, 1);
     int w, h, n;
     unsigned char *data = stbi_load(path, &w, &h, &n, 1);
     if (!data || w <= 0 || h <= 0) { stbi_image_free(data); return NULL; }
@@ -59,6 +62,8 @@ uint8_t *bitgrain_load_grayscale(const char *path,
 uint8_t *bitgrain_load_grayscale_mem(const uint8_t *mem, size_t mem_size,
                                       uint32_t *out_width, uint32_t *out_height)
 {
+    if (bitgrain_tiff_probe_mem(mem, mem_size))
+        return bitgrain_tiff_load_mem(mem, mem_size, out_width, out_height, 1);
     int w, h, n;
     unsigned char *data = stbi_load_from_memory(mem, (int)mem_size, &w, &h, &n, 1);
     if (!data || w <= 0 || h <= 0) { stbi_image_free(data); return NULL; }
@@ -80,6 +85,8 @@ uint8_t *bitgrain_load_rgb(const char *path,
         uint8_t *data = bitgrain_load_webp_rgb(path, out_width, out_height);
         if (data) return data;
     }
+    if (bitgrain_tiff_probe_path(path))
+        return bitgrain_tiff_load(path, out_width, out_height, 3);
     int w, h, n;
     unsigned char *data = stbi_load(path, &w, &h, &n, 3);
     if (!data || w <= 0 || h <= 0) { stbi_image_free(data); return NULL; }
@@ -91,6 +98,8 @@ uint8_t *bitgrain_load_rgb(const char *path,
 uint8_t *bitgrain_load_rgb_mem(const uint8_t *mem, size_t mem_size,
                                 uint32_t *out_width, uint32_t *out_height)
 {
+    if (bitgrain_tiff_probe_mem(mem, mem_size))
+        return bitgrain_tiff_load_mem(mem, mem_size, out_width, out_height, 3);
     int w, h, n;
     unsigned char *data = stbi_load_from_memory(mem, (int)mem_size, &w, &h, &n, 3);
     if (!data || w <= 0 || h <= 0) { stbi_image_free(data); return NULL; }
@@ -112,6 +121,8 @@ uint8_t *bitgrain_load_rgba(const char *path,
         uint8_t *data = bitgrain_load_webp_rgba(path, out_width, out_height);
         if (data) return data;
     }
+    if (bitgrain_tiff_probe_path(path))
+        return bitgrain_tiff_load(path, out_width, out_height, 4);
     int w, h, n;
     unsigned char *data = stbi_load(path, &w, &h, &n, 4);
     if (!data || w <= 0 || h <= 0) { stbi_image_free(data); return NULL; }
@@ -123,6 +134,8 @@ uint8_t *bitgrain_load_rgba(const char *path,
 uint8_t *bitgrain_load_rgba_mem(const uint8_t *mem, size_t mem_size,
                                  uint32_t *out_width, uint32_t *out_height)
 {
+    if (bitgrain_tiff_probe_mem(mem, mem_size))
+        return bitgrain_tiff_load_mem(mem, mem_size, out_width, out_height, 4);
     int w, h, n;
     unsigned char *data = stbi_load_from_memory(mem, (int)mem_size, &w, &h, &n, 4);
     if (!data || w <= 0 || h <= 0) { stbi_image_free(data); return NULL; }
