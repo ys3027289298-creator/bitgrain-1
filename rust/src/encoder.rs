@@ -405,6 +405,32 @@ pub fn encode_grayscale(
     image: &[u8], width: usize, height: usize, quality: u8,
     out: &mut [u8], pos: &mut i32,
 ) {
+    match rd_config_from_env() {
+        Some(Err(msg)) => panic!("bitgrain: {msg}"),
+        Some(Ok(cfg)) => {
+            let encode_at = |q: u8, buf: &mut [u8]| -> usize {
+                let mut p: i32 = 0;
+                encode_grayscale_inner(image, width, height, q, buf, &mut p);
+                p as usize
+            };
+            encode_with_rate_control(
+                width.saturating_mul(height),
+                quality,
+                &cfg,
+                out,
+                pos,
+                encode_at,
+                |stream| psnr_of_stream(image, stream),
+            );
+        }
+        None => encode_grayscale_inner(image, width, height, quality, out, pos),
+    }
+}
+
+fn encode_grayscale_inner(
+    image: &[u8], width: usize, height: usize, quality: u8,
+    out: &mut [u8], pos: &mut i32,
+) {
     write_header(out, pos, BG_MAGIC_GRAY, width, height, quality);
     let table = quant_table_for_quality(quality);
     let blockizer = Blockizer::new(width, height);
@@ -582,15 +608,53 @@ pub fn encode_rgb(
     image: &[u8], width: usize, height: usize, quality: u8,
     out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
 ) {
-    // Default to the better YCbCr path; callers that need legacy RLE use encode_rgb_rle
-    encode_rgb_ycbcr(image, width, height, quality, out, pos, icc);
+    match rd_config_from_env() {
+        Some(Err(msg)) => panic!("bitgrain: {msg}"),
+        Some(Ok(cfg)) => {
+            let encode_at = |q: u8, buf: &mut [u8]| -> usize {
+                let mut p: i32 = 0;
+                encode_rgb_ycbcr(image, width, height, q, buf, &mut p, icc);
+                p as usize
+            };
+            encode_with_rate_control(
+                width.saturating_mul(height),
+                quality,
+                &cfg,
+                out,
+                pos,
+                encode_at,
+                |stream| psnr_of_stream(image, stream),
+            );
+        }
+        // Default to the better YCbCr path; callers that need legacy RLE use encode_rgb_rle
+        None => encode_rgb_ycbcr(image, width, height, quality, out, pos, icc),
+    }
 }
 
 pub fn encode_rgba(
     image: &[u8], width: usize, height: usize, quality: u8,
     out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
 ) {
-    encode_rgba_ycbcr(image, width, height, quality, out, pos, icc);
+    match rd_config_from_env() {
+        Some(Err(msg)) => panic!("bitgrain: {msg}"),
+        Some(Ok(cfg)) => {
+            let encode_at = |q: u8, buf: &mut [u8]| -> usize {
+                let mut p: i32 = 0;
+                encode_rgba_ycbcr(image, width, height, q, buf, &mut p, icc);
+                p as usize
+            };
+            encode_with_rate_control(
+                width.saturating_mul(height),
+                quality,
+                &cfg,
+                out,
+                pos,
+                encode_at,
+                |stream| psnr_of_stream(image, stream),
+            );
+        }
+        None => encode_rgba_ycbcr(image, width, height, quality, out, pos, icc),
+    }
 }
 
 /// Legacy RLE RGB encoder (v2). Used when explicit backward-compat is needed.
@@ -647,3 +711,322 @@ pub fn encode_rgba_rle(
     write_icc_trailer(out, pos, icc);
 }
 
+// ---------------------------------------------------------------------------
+// Optional rate-distortion control (opt-in via environment; default unchanged)
+// ---------------------------------------------------------------------------
+//
+// When BITGRAIN_TARGET_BPP is set to a target bits-per-pixel value, the public
+// encode entry points treat the quality argument as an initial guess and
+// iteratively adjust the quantization step (bisection over the 1..=100 quality
+// grid) until the produced stream lands within BITGRAIN_RD_TOLERANCE bpp of
+// the target (default 0.05) or the BITGRAIN_RD_MAX_ITER budget (default 12)
+// is exhausted. If neither happens (budget spent, or no grid point lands
+// within tolerance), the encoder falls back to the best-effort stream
+// (closest bpp, preferring under-target) and reports
+// status=fallback-best-effort. An invalid target (non-numeric, non-finite,
+// <= 0, or > 64 bpp) aborts the encode with an error. When the env var is
+// unset the encode path is byte-identical to the historical behavior.
+//
+// bpp is measured against source pixels (w*h), i.e. stream_bytes*8/(w*h),
+// covering all planes (luma + chroma [+ alpha]) and the .bg header.
+
+const RD_TARGET_BPP_ENV: &str = "BITGRAIN_TARGET_BPP";
+const RD_MAX_ITER_ENV: &str = "BITGRAIN_RD_MAX_ITER";
+const RD_TOLERANCE_ENV: &str = "BITGRAIN_RD_TOLERANCE";
+const RD_DEFAULT_MAX_ITER: u32 = 12;
+const RD_DEFAULT_TOLERANCE_BPP: f64 = 0.05;
+const RD_MAX_TARGET_BPP: f64 = 64.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RdConfig {
+    target_bpp: f64,
+    max_iterations: u32,
+    tolerance_bpp: f64,
+}
+
+fn parse_rd_config(
+    target: Option<String>,
+    max_iter: Option<String>,
+    tolerance: Option<String>,
+) -> Option<Result<RdConfig, String>> {
+    let raw = target?;
+    let target_bpp: f64 = match raw.trim().parse() {
+        Ok(v) => v,
+        Err(_) => {
+            return Some(Err(format!(
+                "invalid {RD_TARGET_BPP_ENV}='{raw}': expected a positive finite number (bits per pixel)"
+            )));
+        }
+    };
+    if !target_bpp.is_finite() || target_bpp <= 0.0 || target_bpp > RD_MAX_TARGET_BPP {
+        return Some(Err(format!(
+            "invalid {RD_TARGET_BPP_ENV}={target_bpp}: must be in (0, {RD_MAX_TARGET_BPP}] bits/pixel"
+        )));
+    }
+    let max_iterations = match max_iter {
+        Some(v) => match v.trim().parse::<u32>() {
+            Ok(n) if n >= 1 => n,
+            _ => {
+                return Some(Err(format!(
+                    "invalid {RD_MAX_ITER_ENV}='{v}': expected an integer >= 1"
+                )));
+            }
+        },
+        None => RD_DEFAULT_MAX_ITER,
+    };
+    let tolerance_bpp = match tolerance {
+        Some(v) => match v.trim().parse::<f64>() {
+            Ok(t) if t.is_finite() && t > 0.0 => t,
+            _ => {
+                return Some(Err(format!(
+                    "invalid {RD_TOLERANCE_ENV}='{v}': expected a positive finite number (bpp)"
+                )));
+            }
+        },
+        None => RD_DEFAULT_TOLERANCE_BPP,
+    };
+    Some(Ok(RdConfig { target_bpp, max_iterations, tolerance_bpp }))
+}
+
+fn rd_config_from_env() -> Option<Result<RdConfig, String>> {
+    use std::sync::OnceLock;
+    static CONFIG: OnceLock<Option<Result<RdConfig, String>>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            parse_rd_config(
+                std::env::var(RD_TARGET_BPP_ENV).ok(),
+                std::env::var(RD_MAX_ITER_ENV).ok(),
+                std::env::var(RD_TOLERANCE_ENV).ok(),
+            )
+        })
+        .clone()
+}
+
+struct RdOutcome {
+    quality: u8,
+    stream: Vec<u8>,
+    bpp: f64,
+    iterations: u32,
+    converged: bool,
+    grid_exhausted: bool,
+}
+
+/// Bisection over the quality grid toward `cfg.target_bpp`.
+/// `encode_at(q, buf) -> bytes written` must be deterministic for a given q.
+fn rd_search<F>(
+    capacity: usize,
+    pixel_count: usize,
+    initial_quality: u8,
+    cfg: &RdConfig,
+    encode_at: F,
+) -> RdOutcome
+where
+    F: Fn(u8, &mut [u8]) -> usize,
+{
+    let pixels = pixel_count.max(1) as f64;
+    let mut lo: i32 = 1;
+    let mut hi: i32 = 100;
+    let mut q: i32 = initial_quality.clamp(1, 100) as i32;
+    let mut best: Option<(u8, Vec<u8>, f64)> = None;
+    let mut iterations: u32 = 0;
+    let mut converged = false;
+    let mut grid_exhausted = false;
+
+    while iterations < cfg.max_iterations {
+        iterations += 1;
+        let mut scratch = vec![0u8; capacity];
+        let trial = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            encode_at(q as u8, &mut scratch)
+        }));
+        // A panicking or over-capacity trial means the stream did not fit:
+        // treat it as oversize and keep searching at lower qualities.
+        let (written, fits) = match trial {
+            Ok(n) if n <= capacity => (n, true),
+            _ => (0usize, false),
+        };
+        let bpp = if fits { (written as f64 * 8.0) / pixels } else { f64::INFINITY };
+        let err = bpp - cfg.target_bpp;
+        if fits {
+            scratch.truncate(written);
+            eprintln!("[bitgrain-rd] iter={iterations} quality={q} bytes={written} bpp={bpp:.4}");
+            let better = match &best {
+                None => true,
+                Some((_, _, best_bpp)) => {
+                    let best_err = (*best_bpp - cfg.target_bpp).abs();
+                    let new_err = err.abs();
+                    new_err < best_err
+                        || (new_err == best_err
+                            && bpp <= cfg.target_bpp
+                            && *best_bpp > cfg.target_bpp)
+                }
+            };
+            if better {
+                best = Some((q as u8, scratch, bpp));
+            }
+        } else {
+            eprintln!("[bitgrain-rd] iter={iterations} quality={q} bytes=overflow bpp=inf");
+        }
+        if err.abs() <= cfg.tolerance_bpp {
+            converged = true;
+            break;
+        }
+        if bpp > cfg.target_bpp {
+            hi = q - 1;
+        } else {
+            lo = q + 1;
+        }
+        if lo > hi {
+            grid_exhausted = true;
+            break;
+        }
+        q = (lo + hi) / 2;
+    }
+
+    let (quality, stream, bpp) = match best {
+        Some(b) => b,
+        None => {
+            // No trial fit the buffer; force one minimal-quality encode.
+            // If even that overflows, the panic propagates as an encode error.
+            let mut scratch = vec![0u8; capacity];
+            let written = encode_at(1, &mut scratch);
+            scratch.truncate(written);
+            (1u8, scratch, (written as f64 * 8.0) / pixels)
+        }
+    };
+
+    RdOutcome { quality, stream, bpp, iterations, converged, grid_exhausted }
+}
+
+/// PSNR (dB) between the original pixels and the decoded stream.
+fn psnr_of_stream(original: &[u8], stream: &[u8]) -> f64 {
+    let mut w = 0u32;
+    let mut h = 0u32;
+    let mut ch = 0u32;
+    let mut decoded = vec![0u8; original.len()];
+    if !crate::decoder::decode(stream, &mut decoded, &mut w, &mut h, &mut ch, None) {
+        return f64::NAN;
+    }
+    let n = original.len().min(decoded.len());
+    if n == 0 {
+        return f64::NAN;
+    }
+    let mut sum_sq = 0f64;
+    for i in 0..n {
+        let d = original[i] as f64 - decoded[i] as f64;
+        sum_sq += d * d;
+    }
+    let mse = sum_sq / n as f64;
+    if mse <= 0.0 {
+        return f64::INFINITY;
+    }
+    10.0 * (255.0f64 * 255.0 / mse).log10()
+}
+
+fn encode_with_rate_control<F, G>(
+    pixel_count: usize,
+    quality: u8,
+    cfg: &RdConfig,
+    out: &mut [u8],
+    pos: &mut i32,
+    encode_at: F,
+    psnr_db: G,
+) where
+    F: Fn(u8, &mut [u8]) -> usize,
+    G: FnOnce(&[u8]) -> f64,
+{
+    let result = rd_search(out.len(), pixel_count, quality, cfg, encode_at);
+    if result.stream.len() > out.len() {
+        panic!("bitgrain: encode buffer too small for rate-controlled stream");
+    }
+    let psnr = psnr_db(&result.stream);
+    let status = if result.converged { "converged" } else { "fallback-best-effort" };
+    if !result.converged && result.grid_exhausted {
+        eprintln!(
+            "[bitgrain-rd] warning: no quality grid point within tolerance of target; falling back to best-effort quality={}",
+            result.quality
+        );
+    } else if !result.converged {
+        eprintln!(
+            "[bitgrain-rd] warning: target bpp not reached within {} iteration(s); falling back to best-effort quality={}",
+            cfg.max_iterations, result.quality
+        );
+    }
+    eprintln!(
+        "[bitgrain-rd] target_bpp={:.4} actual_bpp={:.4} bytes={} psnr_db={:.2} iterations={} status={}",
+        cfg.target_bpp, result.bpp, result.stream.len(), psnr, result.iterations, status
+    );
+    out[..result.stream.len()].copy_from_slice(&result.stream);
+    *pos = result.stream.len() as i32;
+}
+
+#[cfg(test)]
+mod rd_tests {
+    use super::*;
+
+    fn cfg(target_bpp: f64, max_iterations: u32, tolerance_bpp: f64) -> RdConfig {
+        RdConfig { target_bpp, max_iterations, tolerance_bpp }
+    }
+
+    #[test]
+    fn parse_rejects_invalid_target() {
+        assert!(parse_rd_config(None, None, None).is_none());
+        assert!(parse_rd_config(Some("abc".into()), None, None).unwrap().is_err());
+        assert!(parse_rd_config(Some("0".into()), None, None).unwrap().is_err());
+        assert!(parse_rd_config(Some("-1.5".into()), None, None).unwrap().is_err());
+        assert!(parse_rd_config(Some("inf".into()), None, None).unwrap().is_err());
+        assert!(parse_rd_config(Some("65".into()), None, None).unwrap().is_err());
+        assert!(parse_rd_config(Some("1.5".into()), None, None).unwrap().is_ok());
+        assert!(parse_rd_config(Some("1.5".into()), Some("0".into()), None).unwrap().is_err());
+        assert!(parse_rd_config(Some("1.5".into()), Some("x".into()), None).unwrap().is_err());
+        assert!(parse_rd_config(Some("1.5".into()), None, Some("-0.1".into())).unwrap().is_err());
+        let ok = parse_rd_config(Some("1.5".into()), Some("8".into()), Some("0.05".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok.max_iterations, 8);
+        assert!((ok.tolerance_bpp - 0.05).abs() < 1e-12);
+        assert!((ok.target_bpp - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn search_converges_within_tolerance() {
+        // Synthetic deterministic encoder: size grows strictly with quality.
+        let pixels = 10_000usize;
+        let encode_at = |q: u8, buf: &mut [u8]| -> usize {
+            let n = 100 + 10 * q as usize;
+            assert!(n <= buf.len());
+            n
+        };
+        let c = cfg(0.5, 12, 0.02);
+        let r = rd_search(4096, pixels, 85, &c, encode_at);
+        assert!(r.converged);
+        assert!(r.iterations <= 12);
+        assert!((r.bpp - 0.5).abs() <= 0.02);
+    }
+
+    #[test]
+    fn search_falls_back_when_budget_exhausted() {
+        let pixels = 10_000usize;
+        let encode_at = |q: u8, _buf: &mut [u8]| -> usize { 100 + 10 * q as usize };
+        // Unreachable tolerance + tiny budget: must fall back to best effort.
+        let c = cfg(0.9, 2, 1e-9);
+        let r = rd_search(4096, pixels, 1, &c, encode_at);
+        assert!(!r.converged);
+        assert_eq!(r.iterations, 2);
+        // Visited q=1 (bpp 0.088) and q=51 (bpp 0.488); 0.9 target -> best is q=51.
+        assert_eq!(r.quality, 51);
+        assert!((r.bpp - 0.488).abs() < 1e-9);
+    }
+
+    #[test]
+    fn search_prefers_under_target_on_tie() {
+        let pixels = 8_000usize;
+        // size(q) = q bytes exactly -> bpp = q/1000; target 0.05 bpp = 50 bytes.
+        let encode_at = |q: u8, _buf: &mut [u8]| -> usize { q as usize };
+        let c = cfg(0.05, 12, 1e-12);
+        let r = rd_search(4096, pixels, 50, &c, encode_at);
+        // q=50 gives exactly 0.05 bpp: converged immediately.
+        assert!(r.converged);
+        assert_eq!(r.quality, 50);
+    }
+
+}
