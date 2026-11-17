@@ -24,10 +24,27 @@ use crate::block::Block;
 use crate::colorspace;
 use crate::dct;
 use crate::encoder;
+#[cfg(not(test))]
 use crate::ffi::dequantize_block;
 use crate::huffman;
 use crate::zigzag::ZIGZAG;
 use rayon::prelude::*;
+
+/// Dequantize a block in place (coeff *= table, saturating to i16).
+/// Release builds use the C SIMD kernel; test builds use a pure-Rust
+/// equivalent so unit tests link without the C library.
+#[inline]
+pub(crate) fn dequantize(block: &mut Block, quant: &[i16; 64]) {
+    #[cfg(not(test))]
+    unsafe { dequantize_block(block.data.as_mut_ptr(), quant.as_ptr()); }
+
+    #[cfg(test)]
+    for i in 0..64 {
+        let v = (block.data[i] as i32) * (quant[i] as i32);
+        block.data[i] = v.clamp(-32768, 32767) as i16;
+    }
+}
+
 const BLOCK_TILE_SIZE: usize = 512;
 const PARALLEL_DEQUANT_BLOCKS_THRESHOLD: usize = 384;
 const PARALLEL_DEQUANT_PIXELS_THRESHOLD: usize = 262_144;
@@ -86,7 +103,7 @@ fn decode_rle_to_blocks(buffer: &[u8], mut pos: usize, n: usize) -> Option<(Vec<
 }
 
 #[inline]
-fn write_block_to_plane(block: &Block, plane: &mut [u8], w: usize, h: usize, bx: usize, by: usize) {
+pub(crate) fn write_block_to_plane(block: &Block, plane: &mut [u8], w: usize, h: usize, bx: usize, by: usize) {
     // Fast interior path: avoid bounds checks per pixel.
     if bx + 8 <= w && by + 8 <= h {
         for y in 0..8 {
@@ -125,13 +142,13 @@ fn decode_plane_rle(
     if should_parallel_dequant(n, w, h) {
         blocks.par_chunks_mut(BLOCK_TILE_SIZE).for_each(|chunk| {
             for block in chunk.iter_mut() {
-                unsafe { dequantize_block(block.data.as_mut_ptr(), quant.as_ptr()); }
+                dequantize(block, quant);
                 dct::idct(block);
             }
         });
     } else {
         for block in blocks.iter_mut() {
-            unsafe { dequantize_block(block.data.as_mut_ptr(), quant.as_ptr()); }
+            dequantize(block, quant);
             dct::idct(block);
         }
     }
@@ -188,13 +205,13 @@ fn decode_plane_huffman(
     if should_parallel_dequant(n, w, h) {
         blocks.par_chunks_mut(BLOCK_TILE_SIZE).for_each(|chunk| {
             for block in chunk.iter_mut() {
-                unsafe { dequantize_block(block.data.as_mut_ptr(), quant.as_ptr()); }
+                dequantize(block, quant);
                 dct::idct(block);
             }
         });
     } else {
         for block in blocks.iter_mut() {
-            unsafe { dequantize_block(block.data.as_mut_ptr(), quant.as_ptr()); }
+            dequantize(block, quant);
             dct::idct(block);
         }
     }

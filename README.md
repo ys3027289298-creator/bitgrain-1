@@ -85,6 +85,28 @@ Versions:
 - `v16-v17`: very aggressive perceptual profile
 - `v18-v19`: ultra perceptual + AC sparsify profile (best compression in current branch)
 
+## Progressive decoding
+
+The Rust codec layer (`rust/src/progressive.rs`) can decode Huffman .bg
+streams (v4-v19) in coarse-to-fine rounds: each preview round keeps only the
+first K zigzag DCT coefficients per 8x8 block (default schedule 1/6/15/28)
+and renders a full-size frame, so a loader can show a low-frequency preview
+immediately and refine it round by round.
+
+- Every round — including any interruption point — yields a complete
+  full-size image in the caller's buffer.
+- The final round delegates to the one-shot decoder, so the end result is
+  bit-identical to `bitgrain_decode` (max pixel error 0).
+- Preview working memory is 1.5*w*h bytes (Y+Cb+Cr planes): 50% of the final
+  RGB image, 37.5% for RGBA (alpha renders opaque until the final round).
+- The bitstream is unchanged; any existing v4-v19 .bg file decodes
+  progressively without re-encoding. Legacy RLE streams (v1-v3) fall back to
+  a single one-shot frame.
+
+API: `progressive::decode_progressive(buf, schedule, out, on_frame)`,
+`progressive::probe`, `progressive::preview_working_bytes`. Tests and a
+PSNR/memory report: `cd rust && cargo test --release progressive -- --nocapture`.
+
 ## C API
 
 `includes/encoder.h`.

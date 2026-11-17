@@ -624,6 +624,86 @@ pub fn decode_plane_with_profile(
     Some((blocks, data_end))
 }
 
+/// Streaming, spectrally-capped plane decode used by progressive preview rounds.
+///
+/// Decodes block by block and invokes `visit` for each, so no `Vec<Block>` is
+/// materialized (O(1) working memory beyond the bit reader). Only the first
+/// `coef_cap` zigzag coefficients per block are kept; higher-frequency
+/// coefficients are still consumed from the bitstream (DC deltas and AC runs
+/// must stay in sync) but treated as zero. Returns the new byte position.
+pub(crate) fn decode_plane_streaming_capped<F: FnMut(&Block)>(
+    buf: &[u8],
+    start: usize,
+    n_blocks: usize,
+    is_chroma: bool,
+    use_chroma_ac: bool,
+    use_dc_delta: bool,
+    coef_cap: usize,
+    mut visit: F,
+) -> Option<usize> {
+    if start + 4 > buf.len() { return None; }
+    let plane_len = u32::from_le_bytes(buf[start..start + 4].try_into().unwrap()) as usize;
+    let data_start = start + 4;
+    let data_end = data_start + plane_len;
+    if data_end > buf.len() {
+        return None;
+    }
+
+    let dc_tree = if is_chroma { chroma_dc_tree() } else { luma_dc_tree() };
+    let ac_t = ac_tree(use_chroma_ac);
+    let data = &buf[data_start..data_end];
+    let mut reader = BitReader::new(data, 0);
+    let cap = coef_cap.clamp(1, 64);
+
+    let mut prev_dc: i16 = 0;
+    for _ in 0..n_blocks {
+        let mut block = Block::new();
+
+        // DC (zigzag index 0, always kept)
+        let dc_cat = decode_sym(&mut reader, dc_tree)?;
+        let dc_diff = if dc_cat == 0 {
+            0i16
+        } else {
+            let bits = reader.read_bits(dc_cat)?;
+            magnitude_decode(bits, dc_cat)
+        };
+        let dc_val = if use_dc_delta {
+            let v = prev_dc.wrapping_add(dc_diff);
+            prev_dc = v;
+            v
+        } else {
+            dc_diff
+        };
+        block.data[ZIGZAG[0]] = dc_val;
+
+        // AC: parse every symbol, store only coefficients below the cap.
+        let mut ac_idx = 1usize;
+        loop {
+            let sym = decode_sym(&mut reader, ac_t)?;
+            if sym == 0x00 { break; } // EOB
+            if sym == 0xF0 {
+                if ac_idx + 16 > 64 { return None; }
+                ac_idx += 16;
+                continue;
+            }
+            let run = (sym >> 4) as usize;
+            let cat = sym & 0x0F;
+            if ac_idx + run >= 64 { return None; }
+            ac_idx += run;
+            let bits = reader.read_bits(cat)?;
+            if ac_idx < cap {
+                block.data[ZIGZAG[ac_idx]] = magnitude_decode(bits, cat);
+            }
+            ac_idx += 1;
+            if ac_idx > 64 { return None; }
+        }
+
+        visit(&block);
+    }
+
+    Some(data_end)
+}
+
 fn decode_plane_blocks(
     reader: &mut BitReader,
     n_blocks: usize,

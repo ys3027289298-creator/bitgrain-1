@@ -323,7 +323,15 @@ fn sparsify_ac_block(block: &mut Block, thresholds: &[i16; 64]) {
 
 #[inline]
 pub fn quantize(block: &mut [i16; 64], table: &[i16; 64]) {
+    #[cfg(not(test))]
     unsafe { quantize_block(block.as_mut_ptr(), table.as_ptr()); }
+
+    // Pure-Rust equivalent for unit tests (C kernel does float division with
+    // round-to-nearest-even, matching `round_ties_even`).
+    #[cfg(test)]
+    for i in 0..64 {
+        block[i] = (block[i] as f32 / table[i] as f32).round_ties_even() as i16;
+    }
 }
 
 fn write_header(out: &mut [u8], pos: &mut i32, magic: &[u8; 3], w: usize, h: usize, q: u8) {

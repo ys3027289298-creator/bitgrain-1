@@ -1100,11 +1100,42 @@ pub fn rgba_to_ycbcr420a(image: &[u8], w: usize, h: usize) -> (Vec<u8>, Vec<u8>,
     (y_plane, cb_plane, cr_plane, a_plane)
 }
 
+/// Reconstruct interleaved RGBA from Y/Cb/Cr planes with opaque alpha.
+/// Used by progressive preview rounds, where the alpha plane is not decoded
+/// yet; avoids materializing a full w×h alpha plane of 255s.
+pub(crate) fn ycbcr420_to_rgba_opaque(y: &[u8], cb: &[u8], cr: &[u8], w: usize, _h: usize, out: &mut [u8]) {
+    let cw = (w + 1) / 2;
+    let h = y.len() / w;
+    let mut rgb_row = vec![0u8; w * 3];
+    for py in 0..h {
+        let y_row = py * w;
+        let c_row = (py / 2) * cw;
+        ycbcr420_to_rgb_row_scalar(
+            &y[y_row..y_row + w],
+            &cb[c_row..c_row + cw],
+            &cr[c_row..c_row + cw],
+            w,
+            &mut rgb_row,
+        );
+        let out_row = &mut out[py * w * 4..(py + 1) * w * 4];
+        for x in 0..w {
+            out_row[x * 4] = rgb_row[x * 3];
+            out_row[x * 4 + 1] = rgb_row[x * 3 + 1];
+            out_row[x * 4 + 2] = rgb_row[x * 3 + 2];
+            out_row[x * 4 + 3] = 255;
+        }
+    }
+}
+
 /// Reconstruct interleaved RGB from Y (w×h), Cb and Cr ((cw)×(ch)) planes.
 /// Cb/Cr are upsampled with nearest-neighbor (fast, matches JPEG baseline).
 pub fn ycbcr420_to_rgb(y: &[u8], cb: &[u8], cr: &[u8], w: usize, _h: usize, out: &mut [u8]) {
     let cw = (w + 1) / 2;
     let h = y.len() / w;
+    // Bound the output to exactly h rows: callers may hand in a larger
+    // capacity buffer (e.g. w*h*4 upper bound), and iterating over its full
+    // length would run past the Y/Cb/Cr planes.
+    let out = &mut out[..w * h * 3];
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     let use_avx512 = is_x86_feature_detected!("avx512f");
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -1172,6 +1203,8 @@ pub fn ycbcr420_to_rgb(y: &[u8], cb: &[u8], cr: &[u8], w: usize, _h: usize, out:
 pub fn ycbcr420a_to_rgba(y: &[u8], cb: &[u8], cr: &[u8], a: &[u8], w: usize, _h: usize, out: &mut [u8]) {
     let cw = (w + 1) / 2;
     let h = y.len() / w;
+    // See ycbcr420_to_rgb: tolerate oversized output capacity buffers.
+    let out = &mut out[..w * h * 4];
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     let use_avx512 = is_x86_feature_detected!("avx512f");
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
