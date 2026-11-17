@@ -1,5 +1,6 @@
 pub mod block;
 pub mod blockizer;
+pub mod bipred;
 pub mod bitstream;
 pub mod colorspace;
 pub mod dct;
