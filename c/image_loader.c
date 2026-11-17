@@ -40,6 +40,18 @@ uint8_t *bitgrain_read_stream(FILE *f, size_t *out_size)
     return buf;
 }
 
+/* Native channel count of the source (1=gray, 2=gray+alpha, 3=RGB, 4=RGBA),
+ * or 0 when the format cannot be probed. Lets each loader stay faithful to
+ * the file's actual layout so callers trying rgb -> rgba -> grayscale pick
+ * the matching .bg stream version instead of silently converting. */
+static int native_channels(const char *path, const uint8_t *mem, size_t mem_size)
+{
+    int w, h, n;
+    if (mem)
+        return stbi_info_from_memory(mem, (int)mem_size, &w, &h, &n) ? n : 0;
+    return stbi_info(path, &w, &h, &n) ? n : 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Grayscale                                                            */
 /* ------------------------------------------------------------------ */
@@ -80,6 +92,8 @@ uint8_t *bitgrain_load_rgb(const char *path,
         uint8_t *data = bitgrain_load_webp_rgb(path, out_width, out_height);
         if (data) return data;
     }
+    int nc = native_channels(path, NULL, 0);
+    if (nc != 0 && nc != 3) return NULL; /* not natively RGB */
     int w, h, n;
     unsigned char *data = stbi_load(path, &w, &h, &n, 3);
     if (!data || w <= 0 || h <= 0) { stbi_image_free(data); return NULL; }
@@ -91,6 +105,8 @@ uint8_t *bitgrain_load_rgb(const char *path,
 uint8_t *bitgrain_load_rgb_mem(const uint8_t *mem, size_t mem_size,
                                 uint32_t *out_width, uint32_t *out_height)
 {
+    int nc = native_channels(NULL, mem, mem_size);
+    if (nc != 0 && nc != 3) return NULL; /* not natively RGB */
     int w, h, n;
     unsigned char *data = stbi_load_from_memory(mem, (int)mem_size, &w, &h, &n, 3);
     if (!data || w <= 0 || h <= 0) { stbi_image_free(data); return NULL; }
@@ -112,6 +128,8 @@ uint8_t *bitgrain_load_rgba(const char *path,
         uint8_t *data = bitgrain_load_webp_rgba(path, out_width, out_height);
         if (data) return data;
     }
+    int nc = native_channels(path, NULL, 0);
+    if (nc != 0 && nc != 4 && nc != 2) return NULL; /* not natively alpha-bearing */
     int w, h, n;
     unsigned char *data = stbi_load(path, &w, &h, &n, 4);
     if (!data || w <= 0 || h <= 0) { stbi_image_free(data); return NULL; }
@@ -123,6 +141,8 @@ uint8_t *bitgrain_load_rgba(const char *path,
 uint8_t *bitgrain_load_rgba_mem(const uint8_t *mem, size_t mem_size,
                                  uint32_t *out_width, uint32_t *out_height)
 {
+    int nc = native_channels(NULL, mem, mem_size);
+    if (nc != 0 && nc != 4 && nc != 2) return NULL; /* not natively alpha-bearing */
     int w, h, n;
     unsigned char *data = stbi_load_from_memory(mem, (int)mem_size, &w, &h, &n, 4);
     if (!data || w <= 0 || h <= 0) { stbi_image_free(data); return NULL; }
