@@ -1,0 +1,32 @@
+# Build artifacts
+bitgrain
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Rust / Cargo
+rust/target/
+
+# Logs and temp
+*.log
+*.txt
+
+# Output directories
+test_out/
+bench_out/
+
+# Output/test images (optional; remove if you want to track samples)
+*.png
+*.jpg
+*.jpeg
+*.pgm
+*.bg
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
