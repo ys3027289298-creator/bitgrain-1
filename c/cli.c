@@ -33,6 +33,11 @@ static void usage_encode(const char *prog)
         "  --quality, -q <1-100>  Encode quality (default 85)\n"
         "  --threads, -t <n>      Worker threads (default runtime)\n"
         "  --deterministic        Alias for --threads 1\n"
+        "  --no-sao               Disable sample adaptive offset (legacy v18/19)\n"
+        "  --sao-classes <2|4|5>  SAO edge classes per region (default 5)\n"
+        "  --sao-region <8-256>   SAO region side in pixels (default 64)\n"
+        "  --sao-no-band          Disable band-offset (contouring) candidate\n"
+        "  --sao-directions <4ch> EO directions h,v,135,45 as 0/1, e.g. 1111\n"
         "  --overwrite, -y        Overwrite existing files\n"
         "  --help                 This help\n\n"
         "Examples:\n"
@@ -80,6 +85,9 @@ static void usage_roundtrip(const char *prog)
         "  --threads, -t <n>      Worker threads (default runtime)\n"
         "  --deterministic        Alias for --threads 1\n"
         "  --metrics, -m          Print PSNR/SSIM after processing\n"
+        "  --no-sao               Disable sample adaptive offset (legacy v18/19)\n"
+        "  --sao-classes <2|4|5>  SAO edge classes per region (default 5)\n"
+        "  --sao-region <8-256>   SAO region side in pixels (default 64)\n"
         "  --overwrite, -y        Overwrite existing files\n"
         "  --help                 This help\n\n"
         "Examples:\n"
@@ -183,6 +191,9 @@ int cli_parse_subcommand(int argc, char **argv, cli_ctx_t *ctx, const char *subc
     ctx->quality = 85;
     ctx->jpeg_out_quality = 85;
     ctx->threads = 0;
+    /* SAO on by default; --no-sao emits the legacy v18/v19 stream. */
+    ctx->sao_enabled = 1;
+    ctx->sao_cfg = bitgrain_sao_config_new(0, 5, NULL, 1);
 
     if (strcmp(subcmd, "decode") == 0)
         ctx->decode_mode = 1;
@@ -234,6 +245,67 @@ int cli_parse_subcommand(int argc, char **argv, cli_ctx_t *ctx, const char *subc
         }
         if (strcmp(a, "--deterministic") == 0) {
             ctx->threads = 1;
+            continue;
+        }
+
+        /* ---- Sample Adaptive Offset (in-loop filter) options ---- */
+        if (strcmp(a, "--no-sao") == 0) {
+            ctx->sao_enabled = 0;
+            ctx->sao_cfg.enabled = 0;
+            continue;
+        }
+        if (strcmp(a, "--sao") == 0) {
+            ctx->sao_enabled = 1;
+            ctx->sao_cfg.enabled = 1;
+            continue;
+        }
+        if (strcmp(a, "--sao-classes") == 0 && i + 1 < argc) {
+            int n = atoi(argv[++i]);
+            if (n != 2 && n != 4 && n != 5) {
+                fprintf(stderr, "Error: --sao-classes must be 2, 4 or 5.\n");
+                path_list_free(&input_specs);
+                return -1;
+            }
+            ctx->sao_cfg.edge_classes = (uint8_t)n;
+            continue;
+        }
+        if (strcmp(a, "--sao-region") == 0 && i + 1 < argc) {
+            int r = atoi(argv[++i]);
+            if (r < 8 || r > 256) {
+                fprintf(stderr, "Error: --sao-region must be between 8 and 256.\n");
+                path_list_free(&input_specs);
+                return -1;
+            }
+            ctx->sao_cfg.region_size = (uint16_t)r;
+            continue;
+        }
+        if (strcmp(a, "--sao-no-band") == 0) {
+            ctx->sao_cfg.enable_band = 0;
+            continue;
+        }
+        if (strcmp(a, "--sao-directions") == 0 && i + 1 < argc) {
+            /* Four 0/1 chars, e.g. "1111" or "1000" (h,v,135,45). */
+            const char *s = argv[++i];
+            if (strlen(s) != 4) {
+                fprintf(stderr, "Error: --sao-directions needs 4 chars, e.g. 1111.\n");
+                path_list_free(&input_specs);
+                return -1;
+            }
+            int any = 0;
+            for (int d = 0; d < 4; d++) {
+                if (s[d] != '0' && s[d] != '1') {
+                    fprintf(stderr, "Error: --sao-directions only accepts 0/1.\n");
+                    path_list_free(&input_specs);
+                    return -1;
+                }
+                ctx->sao_cfg.edge_directions[d] = (s[d] == '1');
+                any |= ctx->sao_cfg.edge_directions[d];
+            }
+            if (!any && !ctx->sao_cfg.enable_band) {
+                fprintf(stderr, "Error: --sao-directions cannot disable all modes.\n");
+                path_list_free(&input_specs);
+                return -1;
+            }
             continue;
         }
 
@@ -334,6 +406,9 @@ int cli_parse(int argc, char **argv, cli_ctx_t *ctx)
     ctx->quality = 85;
     ctx->jpeg_out_quality = 85;
     ctx->threads = 0;
+    /* SAO on by default; --no-sao emits the legacy v18/v19 stream. */
+    ctx->sao_enabled = 1;
+    ctx->sao_cfg = bitgrain_sao_config_new(0, 5, NULL, 1);
 
     while ((opt = getopt(argc, argv, "i:o:cdq:Q:t:myvh")) != -1) {
         switch (opt) {

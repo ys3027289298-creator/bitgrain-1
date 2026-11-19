@@ -6,7 +6,7 @@ int parse_bg_header(const uint8_t *buf, uint32_t *width, uint32_t *height, uint3
 {
     if (buf[0] != 'B' || buf[1] != 'G') return -1;
     uint8_t ver = buf[2];
-    if (ver < 1 || ver > 19) return -1;
+    if (ver < 1 || ver > 21) return -1;
     *width   = (uint32_t)buf[3] | ((uint32_t)buf[4]<<8) | ((uint32_t)buf[5]<<16) | ((uint32_t)buf[6]<<24);
     *height  = (uint32_t)buf[7] | ((uint32_t)buf[8]<<8) | ((uint32_t)buf[9]<<16) | ((uint32_t)buf[10]<<24);
     /* v1=gray(1ch), v2=RGB(3ch), v3=RGBA(4ch), v4/v6/v8/v10/v12/v14/v16/v18=YCbCr420→RGB(3ch), v5/v7/v9/v11/v13/v15/v17/v19=YCbCr420A→RGBA(4ch) */
@@ -30,6 +30,8 @@ int parse_bg_header(const uint8_t *buf, uint32_t *width, uint32_t *height, uint3
         case 17: *channels = 4; break; /* very aggressive perceptual profile decodes to RGBA */
         case 18: *channels = 3; break; /* ultra profile decodes to RGB */
         case 19: *channels = 4; break; /* ultra profile decodes to RGBA */
+        case 20: *channels = 3; break; /* v18 entropy + in-loop SAO decodes to RGB */
+        case 21: *channels = 4; break; /* v19 entropy + in-loop SAO decodes to RGBA */
         default: return -1;
     }
     return 0;

@@ -441,3 +441,114 @@ pub extern "C" fn bitgrain_free_icc(ptr: *mut u8, len: u32) {
     }
     let _ = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };
 }
+
+// ---------------------------------------------------------------------------
+// Sample Adaptive Offset (SAO) configuration
+// ---------------------------------------------------------------------------
+
+use crate::sao::{EdgeClasses, SaoConfig};
+
+/// Build the SAO configuration used by the v20/v21 encoders.
+///
+/// * `region_size`: square region side in pixels (clamped to 8..=256, rounded
+///   down to a multiple of 8). 0 selects the default (64).
+/// * `edge_classes`: 2, 4 or 5 (HEVC full set). Any other value selects the
+///   default (5).
+/// * `edge_directions`: 4-byte array, nonzero enables the corresponding
+///   direction (horizontal, vertical, 135°, 45°).
+/// * `enable_band`: nonzero enables the band-offset candidate.
+#[no_mangle]
+pub extern "C" fn bitgrain_sao_config_new(
+    region_size: u16,
+    edge_classes: u8,
+    edge_directions: *const u8,
+    enable_band: u8,
+) -> SaoConfig {
+    let mut cfg = SaoConfig::default();
+    if region_size != 0 {
+        cfg.region_size = region_size;
+    }
+    if let Some(ec) = EdgeClasses::from_count(edge_classes) {
+        cfg.edge_classes = ec;
+    }
+    if !edge_directions.is_null() {
+        let dirs = unsafe { std::slice::from_raw_parts(edge_directions, 4) };
+        for i in 0..4 {
+            cfg.edge_directions[i] = dirs[i] != 0;
+        }
+    }
+    cfg.enable_band = enable_band != 0;
+    cfg
+}
+
+/// Encode RGB with an explicit SAO configuration (v20).
+#[no_mangle]
+pub extern "C" fn bitgrain_encode_rgb_sao(
+    image: *const u8,
+    width: u32,
+    height: u32,
+    out_buffer: *mut u8,
+    out_capacity: u32,
+    out_len: *mut i32,
+    quality: u8,
+    sao_cfg: *const SaoConfig,
+) -> i32 {
+    clear_last_error();
+    if image.is_null() || out_buffer.is_null() || out_len.is_null() || out_capacity == 0 {
+        return fail(BITGRAIN_ERR_INVALID_ARG, "invalid encode_rgb_sao arguments");
+    }
+    ffi_guard(|| {
+        let q = if quality == 0 { 85 } else { quality };
+        let size = (width as usize).saturating_mul(height as usize).saturating_mul(3);
+        let image_slice = unsafe { slice::from_raw_parts(image, size) };
+        let buffer_slice = unsafe { slice::from_raw_parts_mut(out_buffer, out_capacity as usize) };
+        let cfg = if sao_cfg.is_null() {
+            SaoConfig::default()
+        } else {
+            unsafe { *sao_cfg }
+        };
+        let mut pos: i32 = 0;
+        crate::encoder::encode_rgb_with_sao(
+            image_slice, width as usize, height as usize, q,
+            buffer_slice, &mut pos, None, &cfg,
+        );
+        unsafe { *out_len = pos };
+        0
+    })
+}
+
+/// Encode RGBA with an explicit SAO configuration (v21).
+#[no_mangle]
+pub extern "C" fn bitgrain_encode_rgba_sao(
+    image: *const u8,
+    width: u32,
+    height: u32,
+    out_buffer: *mut u8,
+    out_capacity: u32,
+    out_len: *mut i32,
+    quality: u8,
+    sao_cfg: *const SaoConfig,
+) -> i32 {
+    clear_last_error();
+    if image.is_null() || out_buffer.is_null() || out_len.is_null() || out_capacity == 0 {
+        return fail(BITGRAIN_ERR_INVALID_ARG, "invalid encode_rgba_sao arguments");
+    }
+    ffi_guard(|| {
+        let q = if quality == 0 { 85 } else { quality };
+        let size = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        let image_slice = unsafe { slice::from_raw_parts(image, size) };
+        let buffer_slice = unsafe { slice::from_raw_parts_mut(out_buffer, out_capacity as usize) };
+        let cfg = if sao_cfg.is_null() {
+            SaoConfig::default()
+        } else {
+            unsafe { *sao_cfg }
+        };
+        let mut pos: i32 = 0;
+        crate::encoder::encode_rgba_with_sao(
+            image_slice, width as usize, height as usize, q,
+            buffer_slice, &mut pos, None, &cfg,
+        );
+        unsafe { *out_len = pos };
+        0
+    })
+}

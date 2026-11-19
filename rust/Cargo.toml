@@ -10,10 +10,15 @@ categories = ["compression", "multimedia::images"]
 authors = ["Bitgrain contributors"]
 
 [lib]
-crate-type = ["staticlib", "cdylib"]
+# rlib lets in-tree tests/examples link the crate; staticlib/cdylib are the
+# distributable artifacts consumed by the C CLI and language bindings.
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 rayon = "1.10"
+
+[build-dependencies]
+cc = "1.0"
 
 [profile.release]
 lto = true

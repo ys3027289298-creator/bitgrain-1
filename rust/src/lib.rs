@@ -9,6 +9,7 @@ pub mod entropy;
 pub mod ffi;
 pub mod huffman;
 mod jpeg_luma_ac_ht;
+pub mod sao;
 pub mod zigzag;
 
 #[cfg(test)]

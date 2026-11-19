@@ -108,6 +108,72 @@ After all plane blocks, an optional trailer may appear:
 
 Decoders that don't support ICC skip the trailer. Encoders write it only when an ICC profile is provided.
 
+## Sample Adaptive Offset (v20/v21)
+
+Versions 20 (RGB) and 21 (RGBA) use the v18/v19 entropy-coded planes plus an
+in-loop **Sample Adaptive Offset (SAO)** filter applied to the reconstructed Y,
+Cb and Cr planes immediately after IDCT (alpha in v21 is not filtered). The
+filter targets ringing (edge offset) and contouring/banding (band offset) left
+by 8×8 DCT quantization.
+
+### Stream layout
+
+The SAO parameters are stored in a self-describing chunk placed **after all
+plane payloads and before any ICC trailer**. Decoders detect it by its magic;
+older decoders that only know versions ≤19 will refuse the stream at the
+version byte rather than misparse it.
+
+```
+header(12) | Y plane | Cb plane | Cr plane [| A plane] | SAO chunk | [ICC trailer]
+```
+
+### SAO chunk layout
+
+| Bytes | Field | Description |
+|-------|-------|-------------|
+| 3     | magic | `0x42 0x47 0x73` ("BGs") |
+| 1     | flags | Bit field (see below) |
+| 1     | region_side | Square region side in pixels (8–256, multiple of 8) |
+| 4×3   | region_count | Number of regions for Y, Cb, Cr (uint32 LE each) |
+| 4     | payload_len | Total region-record bytes that follow (uint32 LE) |
+| N     | records | One fixed 6-byte record per region, planes in Y, Cb, Cr order |
+
+`flags` bit layout:
+
+| Bits | Meaning |
+|------|---------|
+| 0    | SAO enabled (always 1 in v20/v21) |
+| 1    | band-offset candidate enabled |
+| 2–3  | edge class set: 0 = 2 classes, 1 = 4 classes, 2 = 5 classes |
+| 4–7  | EO directions enabled, one bit each: horizontal, vertical, 135°, 45° |
+
+### Region record (always 6 bytes)
+
+| Offset | Field | Description |
+|--------|-------|-------------|
+| 0      | mode  | 0 = off, 1–4 = EO direction 0–3, 5 = band offset |
+| 1–5    | params | Mode-dependent (below); unused bytes are zero |
+
+* **EO (mode 1–4):** signed int8 offsets, one per enabled class slot. With 2
+  classes: `[valley, peak]`. With 4/5 classes: `[valley, side-valley,
+  side-peak, peak]`. The fifth "flat" class always carries offset 0 and is not
+  stored. EO offsets are limited to ±7.
+* **Band (mode 5):** byte 1 = first band index (0–31; the intensity range
+  0–255 is split into 32 bands of 8 levels), bytes 2–5 = four signed int8
+  offsets for that band and the next three consecutive bands. Band offsets are
+  limited to ±15.
+* **Off (mode 0):** all remaining bytes zero.
+
+### Reproducibility
+
+Classification and offset application use only the reconstructed plane plus
+the signaled parameters — no original pixels are needed at decode time. The
+encoder estimates one constant offset per class as the rounded mean of
+(original − reconstructed) over the class members in a region, and keeps a
+candidate only when it reduces SSE. Because every step is integer and
+deterministic, a conforming decoder reproduces the encoder's filtered samples
+byte-for-byte.
+
 ## Extensions (Future)
 
 - Progressive decode / multi-pass refinement (roadmap).

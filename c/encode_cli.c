@@ -115,7 +115,18 @@ int encode_cli_run(const cli_ctx_t *ctx)
 
         int32_t out_len = 0;
         int ret;
-        if (channels == 4)
+        if (ctx->sao_enabled) {
+            /* v20/v21: in-loop sample adaptive offset with signaled params. */
+            if (channels == 4)
+                ret = bitgrain_encode_rgba_sao(pixels, width, height, out_buf,
+                        (int32_t)out_cap, &out_len, (uint8_t)ctx->quality, &ctx->sao_cfg);
+            else if (channels == 3)
+                ret = bitgrain_encode_rgb_sao(pixels, width, height, out_buf,
+                        (int32_t)out_cap, &out_len, (uint8_t)ctx->quality, &ctx->sao_cfg);
+            else
+                ret = bitgrain_encode_grayscale(pixels, width, height, out_buf,
+                        (int32_t)out_cap, &out_len, (uint8_t)ctx->quality);
+        } else if (channels == 4)
             ret = bitgrain_encode_rgba(pixels, width, height, out_buf, (int32_t)out_cap, &out_len, (uint8_t)ctx->quality);
         else if (channels == 3)
             ret = bitgrain_encode_rgb(pixels, width, height, out_buf, (int32_t)out_cap, &out_len, (uint8_t)ctx->quality);

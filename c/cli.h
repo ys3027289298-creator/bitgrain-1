@@ -3,6 +3,7 @@
 #define BITGRAIN_CLI_H
 
 #include "path_utils.h"
+#include "encoder.h"
 #include <stdint.h>
 
 #define BITGRAIN_VERSION "2.0.0"
@@ -23,6 +24,10 @@ typedef struct {
     int threads;               /* worker threads; 0 = runtime default */
     int use_stdin;             /* input is stdin ("-") */
     int use_stdout;            /* output is stdout ("-") */
+    /* SAO (sample adaptive offset) tuning. sao_enabled=0 emits the legacy
+       v18/v19 stream; otherwise v20/v21 with the configured classifier. */
+    int sao_enabled;
+    bitgrain_sao_config_t sao_cfg;
 } cli_ctx_t;
 
 void cli_usage(const char *prog);

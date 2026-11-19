@@ -145,6 +145,58 @@ int bitgrain_decode_icc(
 
 void bitgrain_free_icc(uint8_t *icc, uint32_t len);
 
+/*
+ * Sample Adaptive Offset (SAO) configuration for the v20/v21 in-loop filter.
+ * Layout mirrors the Rust SaoConfig and is ABI-stable (all fixed-width fields).
+ */
+typedef struct {
+    /* Master switch (always 1 for v20/v21 streams). */
+    uint8_t  enabled;
+    /* Square region side in pixels; 0 means the default (64). */
+    uint16_t region_size;
+    /* Edge classes per EO region: 2, 4 or 5. */
+    uint8_t  edge_classes;
+    /* Four EO directions: horizontal, vertical, 135 deg, 45 deg (nonzero=on). */
+    uint8_t  edge_directions[4];
+    /* Nonzero enables the band-offset (contouring) candidate. */
+    uint8_t  enable_band;
+} bitgrain_sao_config_t;
+
+/*
+ * Fill an SAO config. Pass NULL for edge_directions to keep all four on.
+ * The returned struct is a plain value type; no allocation or free needed.
+ */
+bitgrain_sao_config_t bitgrain_sao_config_new(
+    uint16_t region_size,
+    uint8_t edge_classes,
+    const uint8_t *edge_directions,
+    uint8_t enable_band);
+
+/*
+ * Encode RGB/RGBA with an explicit SAO configuration (v20/v21).
+ * Pass NULL for sao_cfg to use the default (region 64, 5 classes, all
+ * directions, band offset enabled).
+ */
+int bitgrain_encode_rgb_sao(
+    const uint8_t *image,
+    uint32_t width,
+    uint32_t height,
+    uint8_t *out_buffer,
+    uint32_t out_capacity,
+    int32_t *out_len,
+    uint8_t quality,
+    const bitgrain_sao_config_t *sao_cfg);
+
+int bitgrain_encode_rgba_sao(
+    const uint8_t *image,
+    uint32_t width,
+    uint32_t height,
+    uint8_t *out_buffer,
+    uint32_t out_capacity,
+    int32_t *out_len,
+    uint8_t quality,
+    const bitgrain_sao_config_t *sao_cfg);
+
 #ifdef __cplusplus
 }
 #endif

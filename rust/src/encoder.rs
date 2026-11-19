@@ -6,6 +6,7 @@ use crate::dct;
 use crate::entropy;
 use crate::ffi::quantize_block;
 use crate::huffman;
+use crate::sao::{self, SaoConfig};
 use crate::zigzag::ZIGZAG;
 use rayon::prelude::*;
 const BLOCK_TILE_SIZE: usize = 512;
@@ -46,6 +47,8 @@ fn should_parallel_planes(width: usize, height: usize) -> bool {
 ///  17 = YCbCr 4:2:0 + A, very aggressive perceptual quant + chroma AC + DC delta
 ///  18 = YCbCr 4:2:0, ultra perceptual + AC sparsify + chroma AC + DC delta
 ///  19 = YCbCr 4:2:0 + A, ultra perceptual + AC sparsify + chroma AC + DC delta
+///  20 = YCbCr 4:2:0, v18 entropy + in-loop SAO (RGB input)
+///  21 = YCbCr 4:2:0 + A, v19 entropy + in-loop SAO (RGBA input)
 pub const BG_HEADER_SIZE: usize = 3 + 4 + 4 + 1;
 
 const BG_MAGIC_GRAY:    &[u8; 3] = b"BG\x01";
@@ -53,6 +56,14 @@ const BG_MAGIC_RGB:     &[u8; 3] = b"BG\x02";
 const BG_MAGIC_RGBA:    &[u8; 3] = b"BG\x03";
 const BG_MAGIC_YUV420_V8:  &[u8; 3] = b"BG\x12";
 const BG_MAGIC_YUV420A_V8: &[u8; 3] = b"BG\x13";
+/// v20/v21: current best entropy path plus sample adaptive offset.
+const BG_MAGIC_YUV420_SAO:   &[u8; 3] = b"BG\x14"; // 20
+const BG_MAGIC_YUV420A_SAO:  &[u8; 3] = b"BG\x15"; // 21
+
+/// Default SAO configuration for the v20/v21 encode paths.
+pub fn default_sao_config() -> SaoConfig {
+    SaoConfig::default()
+}
 
 /// Standard JPEG luminance quantization table (quality ~50).
 pub fn default_quant_table() -> [i16; 64] {
@@ -575,6 +586,212 @@ pub fn encode_rgba_ycbcr(
 }
 
 // ---------------------------------------------------------------------------
+// SAO path (v20/v21) — v18/v19 entropy + in-loop sample adaptive offset
+// ---------------------------------------------------------------------------
+
+/// Run DCT+quant on one plane's blocks, then reconstruct the post-IDCT plane
+/// (dequant+IDCT on cloned blocks) that SAO estimates against and the decoder
+/// reproduces. The entropy-coded coefficients in `blocks` stay quantized.
+fn prepare_plane_with_recon(
+    blocks: &mut [Block],
+    table: &[i16; 64],
+    plane_w: usize,
+    plane_h: usize,
+    sparsify: &[i16; 64],
+) -> Vec<u8> {
+    if should_parallel_blocks(blocks.len(), plane_w, plane_h) {
+        blocks.par_chunks_mut(BLOCK_TILE_SIZE).for_each(|chunk| {
+            for block in chunk.iter_mut() {
+                dct::dct(block);
+                quantize(&mut block.data, table);
+                sparsify_ac_block(block, sparsify);
+                huffman::clamp_block_jpeg_coeffs(block);
+            }
+        });
+    } else {
+        for block in blocks.iter_mut() {
+            dct::dct(block);
+            quantize(&mut block.data, table);
+            sparsify_ac_block(block, sparsify);
+            huffman::clamp_block_jpeg_coeffs(block);
+        }
+    }
+    // Immutable borrow: reconstruction clones blocks internally, leaving the
+    // quantized coefficients intact for the entropy coder.
+    sao::reconstruct_plane(blocks, table, plane_w, plane_h)
+}
+
+/// Encode RGB image using YCbCr 4:2:0 + Huffman + in-loop SAO (version 20).
+pub fn encode_rgb_ycbcr_sao(
+    image: &[u8], width: usize, height: usize, quality: u8,
+    out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>, sao_cfg: &SaoConfig,
+) {
+    write_header(out, pos, BG_MAGIC_YUV420_SAO, width, height, quality);
+
+    let (y_orig, cb_orig, cr_orig) = colorspace::rgb_to_ycbcr420(image, width, height);
+    let cw = (width + 1) / 2;
+    let ch = (height + 1) / 2;
+
+    let luma_table   = quant_table_for_quality_perceptual_v4(quality);
+    let chroma_table = chroma_quant_table_for_quality_perceptual_v4(quality);
+    let luma_sparsify   = build_sparsify_thresholds(quality, false);
+    let chroma_sparsify = build_sparsify_thresholds(quality, true);
+
+    let blockizer_full   = Blockizer::new(width, height);
+    let blockizer_chroma = Blockizer::new(cw, ch);
+
+    // Coefficient blocks are kept so SAO can reconstruct the exact decoded
+    // planes before they are entropy-coded.
+    let mut yb  = blockizer_full.generate_blocks(&y_orig);
+    let mut cbb = blockizer_chroma.generate_blocks(&cb_orig);
+    let mut crb = blockizer_chroma.generate_blocks(&cr_orig);
+
+    let (y_recon, (cb_recon, cr_recon)) = rayon::join(
+        || prepare_plane_with_recon(&mut yb, &luma_table, width, height, &luma_sparsify),
+        || rayon::join(
+            || prepare_plane_with_recon(&mut cbb, &chroma_table, cw, ch, &chroma_sparsify),
+            || prepare_plane_with_recon(&mut crb, &chroma_table, cw, ch, &chroma_sparsify),
+        ),
+    );
+
+    // Estimate SAO against the original (pre-encode) planes, then apply the
+    // chosen offsets to the reconstructed planes. Both sides use the same
+    // integer classification, so the decoder reproduces these exact bytes.
+    let y_params  = sao::estimate_plane(&y_orig,  &y_recon,  width, height, sao_cfg);
+    let cb_params = sao::estimate_plane(&cb_orig, &cb_recon, cw, ch, sao_cfg);
+    let cr_params = sao::estimate_plane(&cr_orig, &cr_recon, cw, ch, sao_cfg);
+
+    // Exercise the application path on the encoder side too. The filtered
+    // planes are not entropy-coded (the coefficients are); the decoder
+    // independently re-derives identical samples from the signaled parameters.
+    let mut y_plane  = y_recon;
+    let mut cb_plane = cb_recon;
+    let mut cr_plane = cr_recon;
+    sao::apply_plane(&mut y_plane,  width, height, sao_cfg, &y_params);
+    sao::apply_plane(&mut cb_plane, cw, ch, sao_cfg, &cb_params);
+    sao::apply_plane(&mut cr_plane, cw, ch, sao_cfg, &cr_params);
+    drop((y_plane, cb_plane, cr_plane));
+
+    // Entropy-encode the coefficient blocks.
+    let (y_buf, (cb_buf, cr_buf)) = rayon::join(
+        || huffman::encode_plane_with_profile(&yb,  false, false, true),
+        || rayon::join(
+            || huffman::encode_plane_with_profile(&cbb, true, true, true),
+            || huffman::encode_plane_with_profile(&crb, true, true, true),
+        ),
+    );
+
+    bitstream::write_bytes(out, pos, &y_buf);
+    bitstream::write_bytes(out, pos, &cb_buf);
+    bitstream::write_bytes(out, pos, &cr_buf);
+
+    let region_counts = [
+        y_params.len(),
+        cb_params.len(),
+        cr_params.len(),
+    ];
+    let chunk = sao::write_chunk(
+        sao_cfg,
+        [&y_params, &cb_params, &cr_params],
+        region_counts,
+    );
+    bitstream::write_bytes(out, pos, &chunk);
+
+    write_icc_trailer(out, pos, icc);
+}
+
+/// Encode RGBA image using YCbCr 4:2:0 + A + Huffman + in-loop SAO (version 21).
+pub fn encode_rgba_ycbcr_sao(
+    image: &[u8], width: usize, height: usize, quality: u8,
+    out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>, sao_cfg: &SaoConfig,
+) {
+    write_header(out, pos, BG_MAGIC_YUV420A_SAO, width, height, quality);
+
+    let (y_orig, cb_orig, cr_orig, a_orig) = colorspace::rgba_to_ycbcr420a(image, width, height);
+    let cw = (width + 1) / 2;
+    let ch = (height + 1) / 2;
+
+    let luma_table   = quant_table_for_quality_perceptual_v4(quality);
+    let chroma_table = chroma_quant_table_for_quality_perceptual_v4(quality);
+    let luma_sparsify   = build_sparsify_thresholds(quality, false);
+    let chroma_sparsify = build_sparsify_thresholds(quality, true);
+
+    let blockizer_full   = Blockizer::new(width, height);
+    let blockizer_chroma = Blockizer::new(cw, ch);
+
+    let mut yb  = blockizer_full.generate_blocks(&y_orig);
+    let mut cbb = blockizer_chroma.generate_blocks(&cb_orig);
+    let mut crb = blockizer_chroma.generate_blocks(&cr_orig);
+    let mut ab  = blockizer_full.generate_blocks(&a_orig);
+
+    let (y_recon, (cb_recon, cr_recon)) = rayon::join(
+        || prepare_plane_with_recon(&mut yb, &luma_table, width, height, &luma_sparsify),
+        || rayon::join(
+            || prepare_plane_with_recon(&mut cbb, &chroma_table, cw, ch, &chroma_sparsify),
+            || prepare_plane_with_recon(&mut crb, &chroma_table, cw, ch, &chroma_sparsify),
+        ),
+    );
+
+    // Alpha is coded without SAO (it is a coverage plane, not subject to the
+    // same ringing/banding perception), matching the v19 entropy path.
+    if should_parallel_blocks(ab.len(), width, height) {
+        ab.par_chunks_mut(BLOCK_TILE_SIZE).for_each(|chunk| {
+            for block in chunk.iter_mut() {
+                dct::dct(block);
+                quantize(&mut block.data, &luma_table);
+                sparsify_ac_block(block, &luma_sparsify);
+                huffman::clamp_block_jpeg_coeffs(block);
+            }
+        });
+    } else {
+        for block in ab.iter_mut() {
+            dct::dct(block);
+            quantize(&mut block.data, &luma_table);
+            sparsify_ac_block(block, &luma_sparsify);
+            huffman::clamp_block_jpeg_coeffs(block);
+        }
+    }
+
+    let y_params  = sao::estimate_plane(&y_orig,  &y_recon,  width, height, sao_cfg);
+    let cb_params = sao::estimate_plane(&cb_orig, &cb_recon, cw, ch, sao_cfg);
+    let cr_params = sao::estimate_plane(&cr_orig, &cr_recon, cw, ch, sao_cfg);
+
+    let mut y_plane  = y_recon;
+    let mut cb_plane = cb_recon;
+    let mut cr_plane = cr_recon;
+    sao::apply_plane(&mut y_plane,  width, height, sao_cfg, &y_params);
+    sao::apply_plane(&mut cb_plane, cw, ch, sao_cfg, &cb_params);
+    sao::apply_plane(&mut cr_plane, cw, ch, sao_cfg, &cr_params);
+    drop((y_plane, cb_plane, cr_plane));
+
+    let (y_buf, ((cb_buf, cr_buf), a_buf)) = rayon::join(
+        || huffman::encode_plane_with_profile(&yb, false, false, true),
+        || rayon::join(
+            || rayon::join(
+                || huffman::encode_plane_with_profile(&cbb, true, true, true),
+                || huffman::encode_plane_with_profile(&crb, true, true, true),
+            ),
+            || huffman::encode_plane_with_profile(&ab, false, false, true),
+        ),
+    );
+
+    bitstream::write_bytes(out, pos, &y_buf);
+    bitstream::write_bytes(out, pos, &cb_buf);
+    bitstream::write_bytes(out, pos, &cr_buf);
+    bitstream::write_bytes(out, pos, &a_buf);
+
+    let region_counts = [y_params.len(), cb_params.len(), cr_params.len()];
+    let chunk = sao::write_chunk(
+        sao_cfg,
+        [&y_params, &cb_params, &cr_params],
+        region_counts,
+    );
+    bitstream::write_bytes(out, pos, &chunk);
+
+    write_icc_trailer(out, pos, icc);
+}
+
+// ---------------------------------------------------------------------------
 // Legacy RGB/RGBA RLE paths (v2/v3) — kept for backward compat
 // ---------------------------------------------------------------------------
 
@@ -582,7 +799,9 @@ pub fn encode_rgb(
     image: &[u8], width: usize, height: usize, quality: u8,
     out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
 ) {
-    // Default to the better YCbCr path; callers that need legacy RLE use encode_rgb_rle
+    // Backward-compatible entry point: keeps the v18 non-SAO stream so
+    // existing FFI consumers see unchanged bytes. SAO is opt-in via
+    // encode_rgb_with_sao (v20).
     encode_rgb_ycbcr(image, width, height, quality, out, pos, icc);
 }
 
@@ -591,6 +810,24 @@ pub fn encode_rgba(
     out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
 ) {
     encode_rgba_ycbcr(image, width, height, quality, out, pos, icc);
+}
+
+/// RGB encode with an explicit SAO configuration (v20). Pass
+/// `SaoConfig { enabled: false, .. }` is not valid here; use
+/// [`encode_rgb_ycbcr`] for the non-SAO v18 stream.
+pub fn encode_rgb_with_sao(
+    image: &[u8], width: usize, height: usize, quality: u8,
+    out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>, sao_cfg: &SaoConfig,
+) {
+    encode_rgb_ycbcr_sao(image, width, height, quality, out, pos, icc, sao_cfg);
+}
+
+/// RGBA encode with an explicit SAO configuration (v21).
+pub fn encode_rgba_with_sao(
+    image: &[u8], width: usize, height: usize, quality: u8,
+    out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>, sao_cfg: &SaoConfig,
+) {
+    encode_rgba_ycbcr_sao(image, width, height, quality, out, pos, icc, sao_cfg);
 }
 
 /// Legacy RLE RGB encoder (v2). Used when explicit backward-compat is needed.

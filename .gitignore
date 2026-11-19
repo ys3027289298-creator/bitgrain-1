@@ -30,3 +30,6 @@ bench_out/
 *.swp
 *.swo
 *~
+
+# Bench binary
+bitgrain-bench
