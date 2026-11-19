@@ -84,12 +84,14 @@ Versions:
 - `v14-v15`: aggressive perceptual profile
 - `v16-v17`: very aggressive perceptual profile
 - `v18-v19`: ultra perceptual + AC sparsify profile (best compression in current branch)
+- `v20-v21`: inter (P-frame) — block-matching motion estimation (diamond search), MV section + motion-compensated residuals; decode requires the reference frame
 
 ## C API
 
 `includes/encoder.h`.
 
 - Encode: `bitgrain_encode_grayscale`, `bitgrain_encode_rgb`, `bitgrain_encode_rgba`
+- Inter (P-frame): `bitgrain_encode_pframe_rgb`, `bitgrain_encode_pframe_rgba`, `bitgrain_decode_pframe` (needs the decoded reference frame)
 - Decode: `bitgrain_decode(buf, size, pixels, cap, &w, &h, &channels)`
 - Threading: `bitgrain_set_threads` + env overrides in CLI (`BITGRAIN_THREADS`, `BITGRAIN_THREADS_CAP`)
 - Error state: `bitgrain_last_error_code`, `bitgrain_last_error_message`, `bitgrain_clear_error`

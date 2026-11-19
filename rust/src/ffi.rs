@@ -19,6 +19,23 @@ extern "C" {
 
 static RAYON_THREADS_CONFIGURED: AtomicUsize = AtomicUsize::new(0);
 
+// Pure-Rust quant/dequant used by `cargo test` builds, where the C objects
+// (c/quant.c, linked by the Makefile for the real library) are unavailable.
+// Semantics mirror the C scalar implementations.
+#[cfg(test)]
+pub fn quantize_block_rs(block: &mut [i16; 64], table: &[i16; 64]) {
+    for i in 0..64 {
+        block[i] = ((block[i] as f32) / (table[i] as f32)).round() as i16;
+    }
+}
+
+#[cfg(test)]
+pub fn dequantize_block_rs(block: &mut [i16; 64], table: &[i16; 64]) {
+    for i in 0..64 {
+        block[i] = (block[i] as i32 * table[i] as i32).clamp(-32768, 32767) as i16;
+    }
+}
+
 const BITGRAIN_OK: i32 = 0;
 const BITGRAIN_ERR_INVALID_ARG: i32 = 1;
 const BITGRAIN_ERR_DECODE_FAILED: i32 = 2;
@@ -440,4 +457,139 @@ pub extern "C" fn bitgrain_free_icc(ptr: *mut u8, len: u32) {
         return;
     }
     let _ = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };
+}
+
+/// Encode `cur` as an inter (P-frame, v20) .bg stream against the previously
+/// decoded RGB reference frame `ref_frame` (same dimensions, 24 bpp).
+/// quality: 1–100, 0 = default 85.
+#[no_mangle]
+pub extern "C" fn bitgrain_encode_pframe_rgb(
+    cur: *const u8,
+    ref_frame: *const u8,
+    width: u32,
+    height: u32,
+    out_buffer: *mut u8,
+    out_capacity: u32,
+    out_len: *mut i32,
+    quality: u8,
+) -> i32 {
+    clear_last_error();
+    if cur.is_null() || ref_frame.is_null() || out_buffer.is_null() || out_len.is_null()
+        || out_capacity == 0 {
+        return fail(BITGRAIN_ERR_INVALID_ARG, "invalid encode_pframe_rgb arguments");
+    }
+    ffi_guard(|| {
+        let q = if quality == 0 { 85 } else { quality };
+        let size = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(3);
+        let cur_slice = unsafe { slice::from_raw_parts(cur, size) };
+        let ref_slice = unsafe { slice::from_raw_parts(ref_frame, size) };
+        let buffer_slice = unsafe { slice::from_raw_parts_mut(out_buffer, out_capacity as usize) };
+        let mut pos: i32 = 0;
+        crate::encoder::encode_pframe_rgb(
+            cur_slice,
+            ref_slice,
+            width as usize,
+            height as usize,
+            q,
+            buffer_slice,
+            &mut pos,
+            None,
+        );
+        unsafe { *out_len = pos };
+        0
+    })
+}
+
+/// Encode `cur` as an inter (P-frame, v21) .bg stream against the previously
+/// decoded RGBA reference frame `ref_frame` (same dimensions, 32 bpp).
+/// quality: 1–100, 0 = default 85.
+#[no_mangle]
+pub extern "C" fn bitgrain_encode_pframe_rgba(
+    cur: *const u8,
+    ref_frame: *const u8,
+    width: u32,
+    height: u32,
+    out_buffer: *mut u8,
+    out_capacity: u32,
+    out_len: *mut i32,
+    quality: u8,
+) -> i32 {
+    clear_last_error();
+    if cur.is_null() || ref_frame.is_null() || out_buffer.is_null() || out_len.is_null()
+        || out_capacity == 0 {
+        return fail(BITGRAIN_ERR_INVALID_ARG, "invalid encode_pframe_rgba arguments");
+    }
+    ffi_guard(|| {
+        let q = if quality == 0 { 85 } else { quality };
+        let size = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        let cur_slice = unsafe { slice::from_raw_parts(cur, size) };
+        let ref_slice = unsafe { slice::from_raw_parts(ref_frame, size) };
+        let buffer_slice = unsafe { slice::from_raw_parts_mut(out_buffer, out_capacity as usize) };
+        let mut pos: i32 = 0;
+        crate::encoder::encode_pframe_rgba(
+            cur_slice,
+            ref_slice,
+            width as usize,
+            height as usize,
+            q,
+            buffer_slice,
+            &mut pos,
+            None,
+        );
+        unsafe { *out_len = pos };
+        0
+    })
+}
+
+/// Decode a P-frame .bg stream (v20/v21) against the previously decoded
+/// reference frame. `ref_pixels` must use the stream's channel layout
+/// (RGB for v20, RGBA for v21) and the stream's dimensions.
+#[no_mangle]
+pub extern "C" fn bitgrain_decode_pframe(
+    buffer: *const u8,
+    size: i32,
+    ref_pixels: *const u8,
+    out_pixels: *mut u8,
+    out_capacity: u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_channels: *mut u32,
+) -> i32 {
+    clear_last_error();
+    if buffer.is_null() || ref_pixels.is_null() || out_pixels.is_null()
+        || out_width.is_null() || out_height.is_null() || out_channels.is_null() {
+        return fail(BITGRAIN_ERR_INVALID_ARG, "invalid decode_pframe arguments");
+    }
+    if size <= 12 || out_capacity == 0 {
+        return fail(BITGRAIN_ERR_INVALID_ARG, "invalid decode_pframe buffer size/capacity");
+    }
+    ffi_guard(|| {
+        let buf_slice = unsafe { slice::from_raw_parts(buffer, size as usize) };
+        if buf_slice[0] != b'B' || buf_slice[1] != b'G'
+            || (buf_slice[2] != 20 && buf_slice[2] != 21) {
+            return fail(BITGRAIN_ERR_DECODE_FAILED, "not a P-frame stream");
+        }
+        let w = u32::from_le_bytes(buf_slice[3..7].try_into().unwrap()) as usize;
+        let h = u32::from_le_bytes(buf_slice[7..11].try_into().unwrap()) as usize;
+        let ch = if buf_slice[2] == 21 { 4 } else { 3 };
+        let ref_slice = unsafe { slice::from_raw_parts(ref_pixels, w * h * ch) };
+        let out_slice = unsafe { slice::from_raw_parts_mut(out_pixels, out_capacity as usize) };
+        let ok = crate::decoder::decode_pframe(
+            buf_slice,
+            ref_slice,
+            out_slice,
+            unsafe { &mut *out_width },
+            unsafe { &mut *out_height },
+            unsafe { &mut *out_channels },
+        );
+        if ok {
+            0
+        } else {
+            fail(BITGRAIN_ERR_DECODE_FAILED, "decode_pframe failed")
+        }
+    })
 }

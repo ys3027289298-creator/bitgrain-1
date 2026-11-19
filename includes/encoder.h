@@ -145,6 +145,52 @@ int bitgrain_decode_icc(
 
 void bitgrain_free_icc(uint8_t *icc, uint32_t len);
 
+/*
+ * Encode `cur` as an inter (P-frame, v20) .bg stream against the previously
+ * decoded RGB reference frame `ref_frame` (same dimensions, 24 bpp).
+ * Uses block-matching motion estimation (diamond search); macroblocks that
+ * have no good match (e.g. occlusions) are coded intra without a motion
+ * vector. quality: 1–100, 0 = default 85.
+ */
+int bitgrain_encode_pframe_rgb(
+    const uint8_t *cur,
+    const uint8_t *ref_frame,
+    uint32_t width,
+    uint32_t height,
+    uint8_t *out_buffer,
+    uint32_t out_capacity,
+    int32_t *out_len,
+    uint8_t quality);
+
+/*
+ * Encode `cur` as an inter (P-frame, v21) .bg stream against the previously
+ * decoded RGBA reference frame `ref_frame` (same dimensions, 32 bpp).
+ */
+int bitgrain_encode_pframe_rgba(
+    const uint8_t *cur,
+    const uint8_t *ref_frame,
+    uint32_t width,
+    uint32_t height,
+    uint8_t *out_buffer,
+    uint32_t out_capacity,
+    int32_t *out_len,
+    uint8_t quality);
+
+/*
+ * Decode a P-frame .bg stream (v20/v21) against the previously decoded
+ * reference frame. `ref_pixels` must use the stream's channel layout
+ * (RGB for v20, RGBA for v21) and the stream's dimensions.
+ */
+int bitgrain_decode_pframe(
+    const uint8_t *buffer,
+    int32_t size,
+    const uint8_t *ref_pixels,
+    uint8_t *out_pixels,
+    uint32_t out_capacity,
+    uint32_t *out_width,
+    uint32_t *out_height,
+    uint32_t *out_channels);
+
 #ifdef __cplusplus
 }
 #endif

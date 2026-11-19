@@ -4,8 +4,10 @@ use crate::blockizer::Blockizer;
 use crate::colorspace;
 use crate::dct;
 use crate::entropy;
+#[cfg(not(test))]
 use crate::ffi::quantize_block;
 use crate::huffman;
+use crate::motion;
 use crate::zigzag::ZIGZAG;
 use rayon::prelude::*;
 const BLOCK_TILE_SIZE: usize = 512;
@@ -46,6 +48,8 @@ fn should_parallel_planes(width: usize, height: usize) -> bool {
 ///  17 = YCbCr 4:2:0 + A, very aggressive perceptual quant + chroma AC + DC delta
 ///  18 = YCbCr 4:2:0, ultra perceptual + AC sparsify + chroma AC + DC delta
 ///  19 = YCbCr 4:2:0 + A, ultra perceptual + AC sparsify + chroma AC + DC delta
+///  20 = YCbCr 4:2:0 P-frame (motion-compensated inter, RGB input)
+///  21 = YCbCr 4:2:0 + A P-frame (motion-compensated inter, RGBA input)
 pub const BG_HEADER_SIZE: usize = 3 + 4 + 4 + 1;
 
 const BG_MAGIC_GRAY:    &[u8; 3] = b"BG\x01";
@@ -53,6 +57,8 @@ const BG_MAGIC_RGB:     &[u8; 3] = b"BG\x02";
 const BG_MAGIC_RGBA:    &[u8; 3] = b"BG\x03";
 const BG_MAGIC_YUV420_V8:  &[u8; 3] = b"BG\x12";
 const BG_MAGIC_YUV420A_V8: &[u8; 3] = b"BG\x13";
+const BG_MAGIC_YUV420_PFRAME:  &[u8; 3] = b"BG\x14";
+const BG_MAGIC_YUV420A_PFRAME: &[u8; 3] = b"BG\x15";
 
 /// Standard JPEG luminance quantization table (quality ~50).
 pub fn default_quant_table() -> [i16; 64] {
@@ -323,7 +329,10 @@ fn sparsify_ac_block(block: &mut Block, thresholds: &[i16; 64]) {
 
 #[inline]
 pub fn quantize(block: &mut [i16; 64], table: &[i16; 64]) {
+    #[cfg(not(test))]
     unsafe { quantize_block(block.as_mut_ptr(), table.as_ptr()); }
+    #[cfg(test)]
+    crate::ffi::quantize_block_rs(block, table);
 }
 
 fn write_header(out: &mut [u8], pos: &mut i32, magic: &[u8; 3], w: usize, h: usize, q: u8) {
@@ -644,6 +653,89 @@ pub fn encode_rgba_rle(
             .collect()
     };
     for buf in &channel_bufs { bitstream::write_bytes(out, pos, buf); }
+    write_icc_trailer(out, pos, icc);
+}
+
+// ---------------------------------------------------------------------------
+// Inter (P-frame) paths (v20/v21) — block-matching motion estimation
+// ---------------------------------------------------------------------------
+
+/// Encode `cur` as a P-frame against the previously decoded frame `ref_frame`
+/// (both interleaved RGB, same dimensions). Version 20.
+///
+/// Motion is estimated on the luma plane with a diamond search (16×16 MBs),
+/// MVs are chosen by an RD cost (SAD + λ·bits) and stored in an MV section
+/// right after the header; residuals go through the usual DCT/quant/Huffman
+/// plane pipeline. Macroblocks without a good match (e.g. occlusions) fall
+/// back to intra and emit no motion vector.
+pub fn encode_pframe_rgb(
+    cur: &[u8], ref_frame: &[u8], width: usize, height: usize, quality: u8,
+    out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
+) {
+    write_header(out, pos, BG_MAGIC_YUV420_PFRAME, width, height, quality);
+
+    let (y, cb, cr) = colorspace::rgb_to_ycbcr420(cur, width, height);
+    let (ry, rcb, rcr) = colorspace::rgb_to_ycbcr420(ref_frame, width, height);
+    let cw = (width + 1) / 2;
+    let ch = (height + 1) / 2;
+
+    let modes = motion::estimate_frame(&y, &ry, width, height, quality);
+    let mv_section = motion::encode_mv_section(&modes);
+    bitstream::write_bytes(out, pos, &mv_section);
+
+    let luma_table   = quant_table_for_quality_perceptual_v4(quality);
+    let chroma_table = chroma_quant_table_for_quality_perceptual_v4(quality);
+    let luma_sparsify = build_sparsify_thresholds(quality, false);
+    let chroma_sparsify = build_sparsify_thresholds(quality, true);
+
+    let mut yb = motion::generate_residual_blocks(&y, &ry, width, height, &modes, false);
+    let y_buf = encode_channel_huffman(&mut yb, &luma_table, width, height, false, false, true, Some(&luma_sparsify));
+    let mut cbb = motion::generate_residual_blocks(&cb, &rcb, cw, ch, &modes, true);
+    let cb_buf = encode_channel_huffman(&mut cbb, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify));
+    let mut crb = motion::generate_residual_blocks(&cr, &rcr, cw, ch, &modes, true);
+    let cr_buf = encode_channel_huffman(&mut crb, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify));
+
+    bitstream::write_bytes(out, pos, &y_buf);
+    bitstream::write_bytes(out, pos, &cb_buf);
+    bitstream::write_bytes(out, pos, &cr_buf);
+    write_icc_trailer(out, pos, icc);
+}
+
+/// RGBA P-frame (version 21): like v20 plus a full-resolution alpha plane
+/// coded intra (alpha is not motion-compensated).
+pub fn encode_pframe_rgba(
+    cur: &[u8], ref_frame: &[u8], width: usize, height: usize, quality: u8,
+    out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
+) {
+    write_header(out, pos, BG_MAGIC_YUV420A_PFRAME, width, height, quality);
+
+    let (y, cb, cr, a) = colorspace::rgba_to_ycbcr420a(cur, width, height);
+    let (ry, rcb, rcr, _ra) = colorspace::rgba_to_ycbcr420a(ref_frame, width, height);
+    let cw = (width + 1) / 2;
+    let ch = (height + 1) / 2;
+
+    let modes = motion::estimate_frame(&y, &ry, width, height, quality);
+    let mv_section = motion::encode_mv_section(&modes);
+    bitstream::write_bytes(out, pos, &mv_section);
+
+    let luma_table   = quant_table_for_quality_perceptual_v4(quality);
+    let chroma_table = chroma_quant_table_for_quality_perceptual_v4(quality);
+    let luma_sparsify = build_sparsify_thresholds(quality, false);
+    let chroma_sparsify = build_sparsify_thresholds(quality, true);
+
+    let mut yb = motion::generate_residual_blocks(&y, &ry, width, height, &modes, false);
+    let y_buf = encode_channel_huffman(&mut yb, &luma_table, width, height, false, false, true, Some(&luma_sparsify));
+    let mut cbb = motion::generate_residual_blocks(&cb, &rcb, cw, ch, &modes, true);
+    let cb_buf = encode_channel_huffman(&mut cbb, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify));
+    let mut crb = motion::generate_residual_blocks(&cr, &rcr, cw, ch, &modes, true);
+    let cr_buf = encode_channel_huffman(&mut crb, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify));
+    let mut ab = Blockizer::new(width, height).generate_blocks(&a);
+    let a_buf = encode_channel_huffman(&mut ab, &luma_table, width, height, false, false, true, Some(&luma_sparsify));
+
+    bitstream::write_bytes(out, pos, &y_buf);
+    bitstream::write_bytes(out, pos, &cb_buf);
+    bitstream::write_bytes(out, pos, &cr_buf);
+    bitstream::write_bytes(out, pos, &a_buf);
     write_icc_trailer(out, pos, icc);
 }
 

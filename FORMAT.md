@@ -108,6 +108,63 @@ After all plane blocks, an optional trailer may appear:
 
 Decoders that don't support ICC skip the trailer. Encoders write it only when an ICC profile is provided.
 
+## Inter (P-frame) Streams — v20/v21
+
+Versions 20 (RGB) and 21 (RGBA) code a frame against a previously decoded
+reference frame using block-matching motion compensation. A P-frame stream
+cannot be decoded without the reference frame.
+
+### P-frame Layout
+
+```
++----------+------------+----------+-----------+-----------+-----------+--------------+
+|  Header  | MV section | Y plane  | Cb plane  | Cr plane  | A (v21)   | ICC trailer? |
++----------+------------+----------+-----------+-----------+-----------+--------------+
+```
+
+The 12-byte header is identical to intra streams (version 20 or 21).
+
+### MV Section
+
+| Bytes | Field   | Description |
+|-------|---------|-------------|
+| 4     | length  | Payload length in bytes (uint32 LE) |
+| N     | payload | One entry per macroblock, raster order |
+
+The luma plane is divided into 16×16 macroblocks (`ceil(w/16) × ceil(h/16)`).
+Each payload entry is:
+
+- `0x00` — **intra** macroblock (no motion vector), or
+- `0x01 dx dy` — **inter** macroblock; `dx`, `dy` are signed bytes, the
+  motion vector in luma pixels (range ±16).
+
+MV convention: the prediction of pixel (x, y) is `ref(y + dy, x + dx)` with
+edge-clamped coordinates. Chroma planes (4:2:0) reuse the luma MV of the
+corresponding macroblock at half resolution, rounded away from zero.
+
+### P-frame Residual Planes
+
+Each plane is a standard Huffman plane (length-prefixed, see above) of 8×8
+blocks using the v18 quant/sparsify profile (perceptual v4 tables, AC
+sparsify, chroma AC table, DC delta):
+
+- **Inter macroblock:** blocks code the motion-compensated residual
+  `cur − ref(x+dx, y+dy)` (already centered, no −128 offset).
+- **Intra macroblock:** blocks code `pixel − 128`, exactly as in intra streams.
+- **v21 alpha plane:** always coded intra (no motion compensation).
+
+To reconstruct: decode a plane's blocks, dequantize, IDCT, then per pixel
+output `clamp(pred + residual)` for inter macroblocks or
+`clamp(residual + 128)` for intra macroblocks.
+
+### Encoder Notes (reference implementation)
+
+- Motion estimation: diamond search (large-diamond descent + small-diamond
+  refinement), SAD on the luma plane, search range ±16.
+- MV cost: `J = SAD + λ·bits(MV)` with λ derived from quality.
+- A macroblock goes inter only when its RD cost is decisively below the intra
+  cost; occluded/unmatchable regions therefore emit no motion vectors.
+
 ## Extensions (Future)
 
 - Progressive decode / multi-pass refinement (roadmap).

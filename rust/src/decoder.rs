@@ -24,8 +24,10 @@ use crate::block::Block;
 use crate::colorspace;
 use crate::dct;
 use crate::encoder;
+#[cfg(not(test))]
 use crate::ffi::dequantize_block;
 use crate::huffman;
+use crate::motion;
 use crate::zigzag::ZIGZAG;
 use rayon::prelude::*;
 const BLOCK_TILE_SIZE: usize = 512;
@@ -48,6 +50,16 @@ fn should_parallel_dequant(n_blocks: usize, w: usize, h: usize) -> bool {
 fn should_parallel_write(n_blocks: usize, w: usize, h: usize) -> bool {
     n_blocks >= PARALLEL_WRITE_BLOCKS_THRESHOLD
         && w.saturating_mul(h) >= PARALLEL_WRITE_PIXELS_THRESHOLD
+}
+
+/// Dequantize one block. Uses the C SIMD kernel in normal builds and a
+/// pure-Rust equivalent under `cargo test` (C objects are not linked there).
+#[inline]
+fn dequant_block(block: &mut Block, quant: &[i16; 64]) {
+    #[cfg(not(test))]
+    unsafe { dequantize_block(block.data.as_mut_ptr(), quant.as_ptr()); }
+    #[cfg(test)]
+    crate::ffi::dequantize_block_rs(&mut block.data, quant);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,13 +137,13 @@ fn decode_plane_rle(
     if should_parallel_dequant(n, w, h) {
         blocks.par_chunks_mut(BLOCK_TILE_SIZE).for_each(|chunk| {
             for block in chunk.iter_mut() {
-                unsafe { dequantize_block(block.data.as_mut_ptr(), quant.as_ptr()); }
+                dequant_block(block, quant);
                 dct::idct(block);
             }
         });
     } else {
         for block in blocks.iter_mut() {
-            unsafe { dequantize_block(block.data.as_mut_ptr(), quant.as_ptr()); }
+            dequant_block(block, quant);
             dct::idct(block);
         }
     }
@@ -188,13 +200,13 @@ fn decode_plane_huffman(
     if should_parallel_dequant(n, w, h) {
         blocks.par_chunks_mut(BLOCK_TILE_SIZE).for_each(|chunk| {
             for block in chunk.iter_mut() {
-                unsafe { dequantize_block(block.data.as_mut_ptr(), quant.as_ptr()); }
+                dequant_block(block, quant);
                 dct::idct(block);
             }
         });
     } else {
         for block in blocks.iter_mut() {
-            unsafe { dequantize_block(block.data.as_mut_ptr(), quant.as_ptr()); }
+            dequant_block(block, quant);
             dct::idct(block);
         }
     }
@@ -838,4 +850,130 @@ pub fn decode_grayscale(
     let mut ch = 0u32;
     let ok = decode(buffer, out_pixels, out_width, out_height, &mut ch, None);
     ok && ch == 1
+}
+
+// ---------------------------------------------------------------------------
+// Inter (P-frame) decode (v20/v21)
+// ---------------------------------------------------------------------------
+
+fn dequant_idct_blocks(blocks: &mut [Block], quant: &[i16; 64], w: usize, h: usize) {
+    if should_parallel_dequant(blocks.len(), w, h) {
+        blocks.par_chunks_mut(BLOCK_TILE_SIZE).for_each(|chunk| {
+            for block in chunk.iter_mut() {
+                dequant_block(block, quant);
+                dct::idct(block);
+            }
+        });
+    } else {
+        for block in blocks.iter_mut() {
+            dequant_block(block, quant);
+            dct::idct(block);
+        }
+    }
+}
+
+/// Decode one P-frame residual plane: Huffman → dequant+IDCT → add
+/// motion-compensated prediction from `ref_plane` into `plane`.
+fn decode_pframe_plane(
+    buffer: &[u8], pos: usize,
+    w: usize, h: usize,
+    quant: &[i16; 64],
+    is_chroma_plane: bool,
+    modes: &[motion::MbMode],
+    ref_plane: &[u8],
+    plane: &mut [u8],
+) -> Option<usize> {
+    let bw = (w + 7) / 8;
+    let n = bw * ((h + 7) / 8);
+    let (mut blocks, new_pos) =
+        huffman::decode_plane_with_profile(buffer, pos, n, is_chroma_plane, is_chroma_plane, true)?;
+    dequant_idct_blocks(&mut blocks, quant, w, h);
+    motion::reconstruct_plane(&blocks, ref_plane, w, h, modes, is_chroma_plane, plane);
+    Some(new_pos)
+}
+
+/// Decode a P-frame stream (v20 RGB / v21 RGBA) against the previously
+/// decoded reference frame. `ref_pixels` must be the decoded reference in the
+/// same channel layout as the stream (RGB for v20, RGBA for v21).
+pub fn decode_pframe(
+    buffer: &[u8],
+    ref_pixels: &[u8],
+    out_pixels: &mut [u8],
+    out_width: &mut u32,
+    out_height: &mut u32,
+    out_channels: &mut u32,
+) -> bool {
+    if buffer.len() < HEADER_SIZE {
+        return false;
+    }
+    if buffer[0] != b'B' || buffer[1] != b'G' {
+        return false;
+    }
+    let version = buffer[2];
+    if version != 20 && version != 21 {
+        return false;
+    }
+    let has_alpha = version == 21;
+    let channels: usize = if has_alpha { 4 } else { 3 };
+
+    let width = u32::from_le_bytes(buffer[3..7].try_into().unwrap());
+    let height = u32::from_le_bytes(buffer[7..11].try_into().unwrap());
+    let quality = buffer[11];
+    let q = if quality == 0 { 50 } else { quality };
+    if width == 0 || height == 0 || width > 65536 || height > 65536 {
+        return false;
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if ref_pixels.len() < w * h * channels || out_pixels.len() < w * h * channels {
+        return false;
+    }
+    *out_width = width;
+    *out_height = height;
+    *out_channels = channels as u32;
+
+    let (mb_w, mb_h) = motion::mb_grid(w, h);
+    let (modes, mut pos) = match motion::decode_mv_section(buffer, HEADER_SIZE, mb_w * mb_h) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    let cw = (w + 1) / 2;
+    let ch = (h + 1) / 2;
+    let luma_q = encoder::quant_table_for_quality_perceptual_v4(q);
+    let chroma_q = encoder::chroma_quant_table_for_quality_perceptual_v4(q);
+
+    let (ry, rcb, rcr) = if has_alpha {
+        let (y, cb, cr, _a) = colorspace::rgba_to_ycbcr420a(ref_pixels, w, h);
+        (y, cb, cr)
+    } else {
+        colorspace::rgb_to_ycbcr420(ref_pixels, w, h)
+    };
+
+    let mut y_plane = vec![0u8; w * h];
+    let mut cb_plane = vec![0u8; cw * ch];
+    let mut cr_plane = vec![0u8; cw * ch];
+
+    pos = match decode_pframe_plane(buffer, pos, w, h, &luma_q, false, &modes, &ry, &mut y_plane) {
+        Some(p) => p, None => return false,
+    };
+    pos = match decode_pframe_plane(buffer, pos, cw, ch, &chroma_q, true, &modes, &rcb, &mut cb_plane) {
+        Some(p) => p, None => return false,
+    };
+    pos = match decode_pframe_plane(buffer, pos, cw, ch, &chroma_q, true, &modes, &rcr, &mut cr_plane) {
+        Some(p) => p, None => return false,
+    };
+
+    if has_alpha {
+        // Alpha plane is coded intra (no motion compensation).
+        let mut a_plane = vec![0u8; w * h];
+        pos = match decode_plane_huffman(buffer, pos, w, h, &luma_q, false, false, true, &mut a_plane) {
+            Some(p) => p, None => return false,
+        };
+        let _ = pos;
+        colorspace::ycbcr420a_to_rgba(&y_plane, &cb_plane, &cr_plane, &a_plane, w, h, out_pixels);
+    } else {
+        colorspace::ycbcr420_to_rgb(&y_plane, &cb_plane, &cr_plane, w, h, out_pixels);
+    }
+    true
 }

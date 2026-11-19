@@ -103,6 +103,10 @@ bitgrain: $(RUST_TARGET) $(C_OBJS)
 
 $(RUST_TARGET):
 	cd $(RUST_DIR) && CARGO_TARGET_DIR="$(abspath $(RUST_DIR)/target)" RUSTFLAGS="$(RUSTFLAGS_NATIVE)" cargo build --release
+	@# Newer cargo emits the staticlib next to libbitgrain.so, not under deps/.
+	@if [ ! -f "$@" ] && [ -f "$(RUST_DIR)/target/release/libbitgrain.a" ]; then \
+		mkdir -p "$(dir $@)" && cp "$(RUST_DIR)/target/release/libbitgrain.a" "$@"; \
+	fi
 
 # Shared library for Python/Go bindings (Rust cdylib: libbitgrain.so or .dylib)
 RUST_SO = $(RUST_DIR)/target/release/libbitgrain.so
